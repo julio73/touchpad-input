@@ -1,2 +1,5 @@
 .build/
 .home/
+xcuserdata/
+.DS_Store
+/*.xcodeproj

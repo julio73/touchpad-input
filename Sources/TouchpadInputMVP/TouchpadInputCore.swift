@@ -1,16 +1,8 @@
 import AppKit
 import SwiftUI
 
-@main
-struct TouchpadInputMVPApp: App {
-    var body: some Scene {
-        WindowGroup("Touchpad Input MVP") {
-            ContentView()
-                .frame(minWidth: 900, minHeight: 560)
-        }
-    }
-}
-
+// MARK: - Model
+@available(macOS 10.15, *)
 final class InputSession: ObservableObject {
     @Published var outputText: String = ""
     @Published var activeTouches: [TouchPoint] = []
@@ -46,8 +38,11 @@ struct KeyRegion: Identifiable {
     let frame: CGRect
 }
 
+// MARK: - SwiftUI Views
+#if canImport(SwiftUI)
+@available(macOS 10.15, *)
 struct ContentView: View {
-    @StateObject private var session = InputSession()
+    @ObservedObject private var session = InputSession()
     private let layout = KeyboardLayout.defaultLayout
 
     var body: some View {
@@ -55,11 +50,8 @@ struct ContentView: View {
             header
             TouchCaptureRepresentable(layout: layout, session: session)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(alignment: .topLeading) {
-                    debugOverlay
-                        .padding(12)
-                }
-                .background(Color(nsColor: .windowBackgroundColor))
+                .modifier(TopLeadingOverlay(overlay: debugOverlay))
+                .background(backgroundColor)
                 .clipShape(RoundedRectangle(cornerRadius: 14))
 
             outputArea
@@ -84,21 +76,57 @@ struct ContentView: View {
         }
         .font(.system(size: 13, weight: .semibold, design: .monospaced))
         .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .background(Color.black.opacity(0.08))
+        .cornerRadius(10)
+        .padding(12)
     }
 
+    @ViewBuilder
     private var outputArea: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Output")
                 .font(.headline)
-            TextEditor(text: $session.outputText)
-                .font(.system(size: 15, design: .monospaced))
+            if #available(macOS 11.0, *) {
+                TextEditor(text: Binding(get: { session.outputText }, set: { session.outputText = $0 }))
+                    .font(.system(size: 15, design: .monospaced))
+                    .frame(height: 180)
+                    .border(Color.secondary.opacity(0.3))
+            } else {
+                ScrollView {
+                    Text(session.outputText)
+                        .font(.system(size: 15, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 .frame(height: 180)
                 .border(Color.secondary.opacity(0.3))
+            }
+        }
+    }
+
+    private var backgroundColor: Color {
+        if #available(macOS 12.0, *) {
+            return Color(nsColor: .windowBackgroundColor)
+        } else {
+            return Color(NSColor.windowBackgroundColor)
         }
     }
 }
 
+@available(macOS 10.15, *)
+struct TopLeadingOverlay<Overlay: View>: ViewModifier {
+    let overlay: Overlay
+    func body(content: Content) -> some View {
+        if #available(macOS 12.0, *) {
+            content.overlay(alignment: .topLeading) { overlay }
+        } else {
+            content.overlay(
+                ZStack(alignment: .topLeading) { overlay }
+            )
+        }
+    }
+}
+
+@available(macOS 10.15, *)
 struct TouchCaptureRepresentable: NSViewRepresentable {
     let layout: KeyboardLayout
     @ObservedObject var session: InputSession
@@ -115,12 +143,14 @@ struct TouchCaptureRepresentable: NSViewRepresentable {
         nsView.session = session
     }
 }
+#endif
 
+// MARK: - NSView implementation
 final class TouchCaptureView: NSView {
     var layout: KeyboardLayout = .defaultLayout
     weak var session: InputSession?
 
-    private var emittedForTouch: Set<AnyHashable> = []
+    private var emittedForTouch: Set<String> = []
     private var pressureObserver: Any?
 
     override init(frame frameRect: NSRect) {
@@ -143,7 +173,6 @@ final class TouchCaptureView: NSView {
         wantsLayer = true
         layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
         allowedTouchTypes = [.direct, .indirect]
-        acceptsTouchEvents = true
 
         pressureObserver = NSEvent.addLocalMonitorForEvents(matching: .pressure) { [weak self] event in
             self?.handlePressure(event)
@@ -174,22 +203,25 @@ final class TouchCaptureView: NSView {
     }
 
     private func handlePressure(_ event: NSEvent) {
-        session?.pressure = Double(event.pressure)
-        if event.pressure > 0.9 {
-            session?.deleteBackward()
+        if #available(macOS 10.15, *) {
+            session?.pressure = Double(event.pressure)
+            if event.pressure > 0.9 {
+                session?.deleteBackward()
+            }
         }
     }
 
     private func processTouches(_ event: NSEvent, resetEndedTouches: Bool = false) {
         let touches = event.touches(matching: .touching, in: self)
         if resetEndedTouches {
-            emittedForTouch = emittedForTouch.intersection(touches.map { $0.identity })
+            let currentTouchIDs: Set<String> = Set(touches.map { touchIdentifier($0) })
+            emittedForTouch = emittedForTouch.intersection(currentTouchIDs)
         }
 
         var points: [TouchPoint] = []
         for touch in touches {
             let location = convertFromNormalized(touch.normalizedPosition)
-            let touchID = AnyHashable(touch.identity)
+            let touchID = touchIdentifier(touch)
             points.append(TouchPoint(id: String(describing: touchID), x: location.x, y: location.y))
 
             if !emittedForTouch.contains(touchID), let key = keyLabel(at: location) {
@@ -198,8 +230,14 @@ final class TouchCaptureView: NSView {
             }
         }
 
-        session?.activeTouches = points
+        if #available(macOS 10.15, *) {
+            session?.activeTouches = points
+        }
         needsDisplay = true
+    }
+
+    private func touchIdentifier(_ touch: NSTouch) -> String {
+        String(describing: touch.identity)
     }
 
     private func convertFromNormalized(_ point: NSPoint) -> NSPoint {
@@ -211,13 +249,15 @@ final class TouchCaptureView: NSView {
     }
 
     private func emitKey(_ key: String) {
-        switch key {
-        case "SPACE":
-            session?.appendCharacter(" ")
-        case "DEL":
-            session?.deleteBackward()
-        default:
-            session?.appendCharacter(key.lowercased())
+        if #available(macOS 10.15, *) {
+            switch key {
+            case "SPACE":
+                session?.appendCharacter(" ")
+            case "DEL":
+                session?.deleteBackward()
+            default:
+                session?.appendCharacter(key.lowercased())
+            }
         }
     }
 
@@ -228,10 +268,18 @@ final class TouchCaptureView: NSView {
             path.lineWidth = 1
             path.stroke()
 
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
-                .foregroundColor: NSColor.secondaryLabelColor
-            ]
+            let attributes: [NSAttributedString.Key: Any]
+            if #available(macOS 10.15, *) {
+                attributes = [
+                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            } else {
+                attributes = [
+                    .font: NSFont.systemFont(ofSize: 11),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            }
             let text = NSAttributedString(string: region.label, attributes: attributes)
             let textSize = text.size()
             let textOrigin = NSPoint(
@@ -244,13 +292,16 @@ final class TouchCaptureView: NSView {
 
     private func drawTouchMarkers() {
         NSColor.systemBlue.withAlphaComponent(0.8).setFill()
-        for point in session?.activeTouches ?? [] {
-            let marker = NSBezierPath(ovalIn: CGRect(x: point.x - 10, y: point.y - 10, width: 20, height: 20))
-            marker.fill()
+        if let points = session?.activeTouches {
+            for point in points {
+                let marker = NSBezierPath(ovalIn: CGRect(x: point.x - 10, y: point.y - 10, width: 20, height: 20))
+                marker.fill()
+            }
         }
     }
 }
 
+// MARK: - Layout
 struct KeyboardLayout {
     let rows: [[String]]
 
