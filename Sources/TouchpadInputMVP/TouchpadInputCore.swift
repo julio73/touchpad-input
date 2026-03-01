@@ -54,7 +54,8 @@ final class MultitouchCapture: @unchecked Sendable {
     static let shared = MultitouchCapture()
 
     nonisolated(unsafe) weak var session: TouchDiagnosticSession?
-    private nonisolated(unsafe) var capsLockMonitor: Any?
+    private nonisolated(unsafe) var keyMonitor: Any?
+    private nonisolated(unsafe) var lastControlPressTime: TimeInterval = 0
     private nonisolated(unsafe) var devices: [AnyObject] = []
 
     private let lib = dlopen(
@@ -62,25 +63,34 @@ final class MultitouchCapture: @unchecked Sendable {
         RTLD_LAZY
     )
 
-    // Call from onAppear — sets up CapsLock as the mode toggle
-    func setupCapsLockToggle(for session: TouchDiagnosticSession) {
+    // Call from onAppear — double-tap either Control key toggles capture
+    func setupDoubleControlToggle(for session: TouchDiagnosticSession) {
         self.session = session
-        capsLockMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            guard event.keyCode == 57, let self else { return }
-            let active = event.modifierFlags.contains(.capsLock)
-            DispatchQueue.main.async {
-                guard let session = self.session else { return }
-                if active { self.start(session: session) } else { self.stop() }
+        keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            guard let self else { return }
+            // keyCode 59 = left ctrl, 62 = right ctrl; only fire on key-down (flag present)
+            guard (event.keyCode == 59 || event.keyCode == 62),
+                  event.modifierFlags.contains(.control) else { return }
+            let now = event.timestamp
+            if now - self.lastControlPressTime < 0.35 {
+                self.lastControlPressTime = 0
+                DispatchQueue.main.async {
+                    guard let s = self.session else { return }
+                    if s.isActive { self.stop() } else { self.start(session: s) }
+                }
+            } else {
+                self.lastControlPressTime = now
             }
         }
     }
 
     // Call from onDisappear
-    func teardownCapsLockToggle() {
-        if let monitor = capsLockMonitor {
+    func teardownDoubleControlToggle() {
+        if let monitor = keyMonitor {
             NSEvent.removeMonitor(monitor)
-            capsLockMonitor = nil
+            keyMonitor = nil
         }
+        lastControlPressTime = 0
         stop()
     }
 
@@ -281,8 +291,8 @@ struct ContentView: View {
             Divider()
             EventLogPanel(entries: session.eventLog)
         }
-        .onAppear  { MultitouchCapture.shared.setupCapsLockToggle(for: session) }
-        .onDisappear { MultitouchCapture.shared.teardownCapsLockToggle() }
+        .onAppear  { MultitouchCapture.shared.setupDoubleControlToggle(for: session) }
+        .onDisappear { MultitouchCapture.shared.teardownDoubleControlToggle() }
     }
 
     private var header: some View {
@@ -300,11 +310,11 @@ struct ContentView: View {
     private var modePill: some View {
         Group {
             if session.isActive {
-                Text("● CAPTURING")
+                Text("● CAPTURING  —  double ctrl to stop")
                     .foregroundColor(.white)
                     .background(Color.green)
             } else {
-                Text("○ OFF  —  press CapsLock")
+                Text("○ OFF  —  double ctrl to start")
                     .foregroundColor(.secondary)
                     .background(Color.secondary.opacity(0.12))
             }
@@ -334,7 +344,7 @@ struct TrackpadSurface: View {
                     )
 
                 if fingers.isEmpty {
-                    Text(isActive ? "Place fingers on trackpad" : "Press CapsLock to start")
+                    Text(isActive ? "Place fingers on trackpad" : "Double-tap ctrl to start")
                         .font(.system(size: 14))
                         .foregroundColor(.secondary)
                 }
