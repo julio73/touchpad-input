@@ -1,14 +1,150 @@
 import AppKit
 import SwiftUI
+import Darwin
+
+// MARK: - MultitouchSupport private framework types
+// Layout mirrors the C struct in MultitouchSupport.framework.
+// If finger dots appear in wrong positions the struct layout has drifted —
+// file an issue and we'll adjust the padding/field order.
+
+struct MTVector { var x, y: Float }
+struct MTPoint  { var position, velocity: MTVector }
+struct MTContact {
+    var frame:          Int32   // offset 0
+    var timestamp:      Double  // offset 8  (4 bytes padding after frame)
+    var identifier:     Int32   // offset 16 — stable ID for this touch session
+    var state:          Int32   // offset 20 — raw hardware state
+    var fingerId:       Int32   // offset 24
+    var handId:         Int32   // offset 28
+    var normalized:     MTPoint // offset 32 — position + velocity, each 0…1
+    var size:           Float   // offset 48 — contact area
+    var unknown1:       Int32   // offset 52
+    var angle:          Float   // offset 56
+    var majorAxis:      Float   // offset 60
+    var minorAxis:      Float   // offset 64
+    var absoluteVector: MTPoint // offset 68
+    var unknown2:       (Int32, Int32) // offset 84
+    var zDensity:       Float   // offset 92 — pressure-like value
+}
+
+// C callback — cannot capture Swift context, routes through the singleton.
+// All parameters must be plain C types; use UnsafeRawPointer and rebind inside.
+private typealias MTCallbackFn = @convention(c) (
+    UnsafeRawPointer?,   // device (unused)
+    UnsafeRawPointer?,   // contacts array (rebound to MTContact inside)
+    Int32,               // count
+    Double,              // timestamp
+    Int32                // frame number (unused)
+) -> Void
+
+private let mtFrameCallback: MTCallbackFn = { _, rawPtr, count, timestamp, _ in
+    guard let rawPtr, count > 0 else { return }
+    let n = Int(count)
+    let contacts = rawPtr.withMemoryRebound(to: MTContact.self, capacity: n) { ptr in
+        Array(UnsafeBufferPointer(start: ptr, count: n))
+    }
+    DispatchQueue.main.async {
+        MultitouchCapture.shared.session?.update(mtContacts: contacts, timestamp: timestamp)
+    }
+}
+
+// MARK: - MultitouchCapture
+
+final class MultitouchCapture: @unchecked Sendable {
+    static let shared = MultitouchCapture()
+
+    nonisolated(unsafe) weak var session: TouchDiagnosticSession?
+    private nonisolated(unsafe) var capsLockMonitor: Any?
+    private nonisolated(unsafe) var devices: [AnyObject] = []
+
+    private let lib = dlopen(
+        "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport",
+        RTLD_LAZY
+    )
+
+    // Call from onAppear — sets up CapsLock as the mode toggle
+    func setupCapsLockToggle(for session: TouchDiagnosticSession) {
+        self.session = session
+        capsLockMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            guard event.keyCode == 57, let self else { return }
+            let active = event.modifierFlags.contains(.capsLock)
+            DispatchQueue.main.async {
+                guard let session = self.session else { return }
+                if active { self.start(session: session) } else { self.stop() }
+            }
+        }
+    }
+
+    // Call from onDisappear
+    func teardownCapsLockToggle() {
+        if let monitor = capsLockMonitor {
+            NSEvent.removeMonitor(monitor)
+            capsLockMonitor = nil
+        }
+        stop()
+    }
+
+    func start(session: TouchDiagnosticSession) {
+        stopDevices()
+        self.session = session
+
+        guard let lib else {
+            print("[MT] could not open MultitouchSupport.framework")
+            return
+        }
+
+        typealias CreateListFn = @convention(c) () -> CFArray
+        typealias RegisterFn   = @convention(c) (UnsafeRawPointer, MTCallbackFn) -> Void
+        typealias StartFn      = @convention(c) (UnsafeRawPointer, Int32) -> Void
+
+        guard
+            let cs = dlsym(lib, "MTDeviceCreateList"),
+            let rs = dlsym(lib, "MTRegisterContactFrameCallback"),
+            let ss = dlsym(lib, "MTDeviceStart")
+        else {
+            print("[MT] could not resolve symbols")
+            return
+        }
+
+        let createList  = unsafeBitCast(cs, to: CreateListFn.self)
+        let registerCb  = unsafeBitCast(rs, to: RegisterFn.self)
+        let startDevice = unsafeBitCast(ss, to: StartFn.self)
+
+        devices = createList() as [AnyObject]
+        for device in devices {
+            let raw = Unmanaged.passUnretained(device).toOpaque()
+            registerCb(raw, mtFrameCallback)
+            startDevice(raw, 0)
+        }
+        session.isActive = true
+    }
+
+    func stop() {
+        session?.isActive = false
+        session?.liveFingers = []
+        stopDevices()
+    }
+
+    private func stopDevices() {
+        defer { devices = [] }
+        guard let lib, !devices.isEmpty else { return }
+        typealias StopFn = @convention(c) (UnsafeRawPointer) -> Void
+        guard let sym = dlsym(lib, "MTDeviceStop") else { return }
+        let stopDevice = unsafeBitCast(sym, to: StopFn.self)
+        for device in devices {
+            stopDevice(Unmanaged.passUnretained(device).toOpaque())
+        }
+    }
+}
 
 // MARK: - Data Model
 
 struct FingerState: Identifiable {
-    let id: String           // raw NSTouch identity string
-    let label: String        // short display label: #1, #2, …
-    let x: CGFloat           // normalized trackpad position, 0…1
-    let y: CGFloat           // normalized trackpad position, 0…1
-    let pressure: CGFloat
+    let id: String           // String(MTContact.identifier)
+    let label: String        // #1, #2, …
+    let x: CGFloat           // normalized 0…1
+    let y: CGFloat           // normalized 0…1
+    let pressure: CGFloat    // from zDensity, clamped 0…1
     let phase: String
     let lastEventTime: TimeInterval
     let deltaMsFromPrev: Int?
@@ -22,26 +158,43 @@ struct TouchLogEntry: Identifiable {
     let x: CGFloat
     let y: CGFloat
     let pressure: CGFloat
-    let deltaMs: Int?        // nil for first event from a finger
+    let deltaMs: Int?
+    let rawState: Int32      // raw MTContact.state — useful during Phase 1 exploration
 }
 
 final class TouchDiagnosticSession: ObservableObject {
     @Published var liveFingers: [FingerState] = []
     @Published var eventLog: [TouchLogEntry] = []
-    @Published var livePressure: CGFloat = 0
+    @Published var isActive: Bool = false
 
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
     private var labelCounter = 0
     private let maxLogEntries = 500
 
-    func update(touches: [NSTouch], timestamp: TimeInterval) {
+    func update(mtContacts contacts: [MTContact], timestamp: Double) {
+        let currentIDs = Set(contacts.map { String($0.identifier) })
         var liveLookup: [String: FingerState] = Dictionary(
             uniqueKeysWithValues: liveFingers.map { ($0.id, $0) }
         )
 
-        for touch in touches {
-            let rawID = String(describing: touch.identity)
+        // Synthesize "ended" for fingers that disappeared from the frame
+        for id in Set(liveLookup.keys).subtracting(currentIDs) {
+            if let prev = liveLookup[id] {
+                appendLog(TouchLogEntry(
+                    timestamp: Date(), fingerLabel: prev.label,
+                    phase: "ended", x: prev.x, y: prev.y,
+                    pressure: prev.pressure, deltaMs: nil, rawState: -1
+                ))
+            }
+            liveLookup.removeValue(forKey: id)
+            fingerLastTime.removeValue(forKey: id)
+        }
+
+        // Update active contacts
+        for contact in contacts {
+            let rawID = String(contact.identifier)
+            let isNew = liveLookup[rawID] == nil
 
             if fingerLabels[rawID] == nil {
                 labelCounter += 1
@@ -56,46 +209,39 @@ final class TouchDiagnosticSession: ObservableObject {
                 deltaMs = nil
             }
 
-            let x = touch.normalizedPosition.x
-            let y = touch.normalizedPosition.y
-            let phaseStr = phaseString(touch.phase)
+            let x = CGFloat(contact.normalized.position.x)
+            let y = CGFloat(contact.normalized.position.y)
+            let pressure = CGFloat(min(max(contact.zDensity, 0), 1))
 
-            // Skip logging stationary events — too noisy; live table still shows them
-            if touch.phase != .stationary {
+            let phase: String
+            if isNew {
+                phase = "began"
+            } else if let prev = liveLookup[rawID],
+                      abs(prev.x - x) < 0.0005 && abs(prev.y - y) < 0.0005 {
+                phase = "stationary"
+            } else {
+                phase = "moved"
+            }
+
+            if phase != "stationary" {
                 appendLog(TouchLogEntry(
-                    timestamp: Date(),
-                    fingerLabel: label,
-                    phase: phaseStr,
-                    x: x,
-                    y: y,
-                    pressure: livePressure,
-                    deltaMs: deltaMs
+                    timestamp: Date(), fingerLabel: label,
+                    phase: phase, x: x, y: y,
+                    pressure: pressure, deltaMs: deltaMs,
+                    rawState: contact.state
                 ))
             }
 
-            if touch.phase == .ended || touch.phase == .cancelled {
-                liveLookup.removeValue(forKey: rawID)
-                fingerLastTime.removeValue(forKey: rawID)
-            } else {
-                fingerLastTime[rawID] = timestamp
-                liveLookup[rawID] = FingerState(
-                    id: rawID,
-                    label: label,
-                    x: x,
-                    y: y,
-                    pressure: livePressure,
-                    phase: phaseStr,
-                    lastEventTime: timestamp,
-                    deltaMsFromPrev: deltaMs
-                )
-            }
+            fingerLastTime[rawID] = timestamp
+            liveLookup[rawID] = FingerState(
+                id: rawID, label: label,
+                x: x, y: y, pressure: pressure,
+                phase: phase, lastEventTime: timestamp,
+                deltaMsFromPrev: deltaMs
+            )
         }
 
         liveFingers = Array(liveLookup.values).sorted { $0.label < $1.label }
-    }
-
-    func updatePressure(_ pressure: CGFloat) {
-        livePressure = pressure
     }
 
     func clearAll() {
@@ -104,24 +250,12 @@ final class TouchDiagnosticSession: ObservableObject {
         fingerLabels = [:]
         fingerLastTime = [:]
         labelCounter = 0
-        livePressure = 0
     }
 
     private func appendLog(_ entry: TouchLogEntry) {
         eventLog.append(entry)
         if eventLog.count > maxLogEntries {
             eventLog.removeFirst(eventLog.count - maxLogEntries)
-        }
-    }
-
-    private func phaseString(_ phase: NSTouch.Phase) -> String {
-        switch phase {
-        case .began:      return "began"
-        case .moved:      return "moved"
-        case .stationary: return "stationary"
-        case .ended:      return "ended"
-        case .cancelled:  return "cancelled"
-        default:          return "unknown"
         }
     }
 }
@@ -138,26 +272,24 @@ struct ContentView: View {
             header
             Divider()
             HStack(spacing: 0) {
-                trackpadPanel
+                TrackpadSurface(fingers: session.liveFingers, isActive: session.isActive)
+                    .padding(16)
                 Divider()
-                FingerTablePanel(fingers: session.liveFingers, pressure: session.livePressure)
+                FingerTablePanel(fingers: session.liveFingers)
                     .frame(width: 340)
             }
             Divider()
             EventLogPanel(entries: session.eventLog)
         }
+        .onAppear  { MultitouchCapture.shared.setupCapsLockToggle(for: session) }
+        .onDisappear { MultitouchCapture.shared.teardownCapsLockToggle() }
     }
 
     private var header: some View {
         HStack(spacing: 10) {
             Text("Touchpad Diagnostics")
                 .font(.system(size: 18, weight: .semibold))
-            Text("Phase 1 — Raw Signal")
-                .font(.system(size: 12, weight: .medium))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Color.accentColor.opacity(0.12))
-                .cornerRadius(6)
+            modePill
             Spacer()
             Button("Clear") { session.clearAll() }
         }
@@ -165,12 +297,22 @@ struct ContentView: View {
         .padding(.vertical, 12)
     }
 
-    private var trackpadPanel: some View {
-        ZStack {
-            TrackpadSurface(fingers: session.liveFingers)
-            TouchCaptureRepresentable(session: session)
+    private var modePill: some View {
+        Group {
+            if session.isActive {
+                Text("● CAPTURING")
+                    .foregroundColor(.white)
+                    .background(Color.green)
+            } else {
+                Text("○ OFF  —  press CapsLock")
+                    .foregroundColor(.secondary)
+                    .background(Color.secondary.opacity(0.12))
+            }
         }
-        .padding(16)
+        .font(.system(size: 11, weight: .medium, design: .monospaced))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 }
 
@@ -178,6 +320,7 @@ struct ContentView: View {
 
 struct TrackpadSurface: View {
     let fingers: [FingerState]
+    let isActive: Bool
 
     var body: some View {
         GeometryReader { geo in
@@ -185,16 +328,19 @@ struct TrackpadSurface: View {
                 RoundedRectangle(cornerRadius: 12)
                     .fill(Color(NSColor.controlBackgroundColor))
                 RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
+                    .stroke(
+                        isActive ? Color.green.opacity(0.4) : Color.secondary.opacity(0.25),
+                        lineWidth: isActive ? 1.5 : 1
+                    )
 
                 if fingers.isEmpty {
-                    Text("Place fingers on trackpad")
+                    Text(isActive ? "Place fingers on trackpad" : "Press CapsLock to start")
                         .font(.system(size: 14))
                         .foregroundColor(.secondary)
                 }
 
                 ForEach(fingers) { finger in
-                    // trackpad y=0 is bottom; SwiftUI y=0 is top, so flip
+                    // trackpad y=0 is bottom; SwiftUI y=0 is top
                     let x = finger.x * geo.size.width
                     let y = (1.0 - finger.y) * geo.size.height
                     ZStack {
@@ -224,7 +370,6 @@ struct TrackpadSurface: View {
 
 struct FingerTablePanel: View {
     let fingers: [FingerState]
-    let pressure: CGFloat
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -237,18 +382,7 @@ struct FingerTablePanel: View {
             columnHeaders
             Divider()
             fingerRows
-
             Spacer()
-            Divider()
-
-            HStack(spacing: 6) {
-                Text("Pressure")
-                    .foregroundColor(.secondary)
-                Text(String(format: "%.3f", pressure))
-                    .foregroundColor(pressure > 0.5 ? .orange : .primary)
-            }
-            .font(.system(size: 13, design: .monospaced))
-            .padding(16)
         }
     }
 
@@ -369,6 +503,11 @@ struct EventLogRow: View {
                 .frame(width: 98, alignment: .leading)
             Text(String(format: "p=%.2f", entry.pressure))
                 .frame(width: 55, alignment: .leading)
+            if entry.rawState >= 0 {
+                Text("s\(entry.rawState)")
+                    .foregroundColor(.secondary)
+                    .frame(width: 28, alignment: .leading)
+            }
             if let delta = entry.deltaMs {
                 Text("Δ\(delta)ms")
                     .foregroundColor(.orange)
@@ -397,63 +536,4 @@ struct EventLogRow: View {
     }
 }
 
-// MARK: - Touch Capture NSView Bridge
-
-struct TouchCaptureRepresentable: NSViewRepresentable {
-    let session: TouchDiagnosticSession
-
-    func makeNSView(context: Context) -> TouchCaptureView {
-        let view = TouchCaptureView()
-        view.session = session
-        return view
-    }
-
-    func updateNSView(_ nsView: TouchCaptureView, context: Context) {
-        nsView.session = session
-    }
-}
-
 #endif // canImport(SwiftUI)
-
-// MARK: - Touch Capture NSView
-
-final class TouchCaptureView: NSView {
-    weak var session: TouchDiagnosticSession?
-    private var pressureObserver: Any?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        setup()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        setup()
-    }
-
-    deinit {
-        if let obs = pressureObserver { NSEvent.removeMonitor(obs) }
-    }
-
-    private func setup() {
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
-        allowedTouchTypes = [.indirect]   // trackpad only
-
-        pressureObserver = NSEvent.addLocalMonitorForEvents(matching: .pressure) { [weak self] event in
-            self?.session?.updatePressure(CGFloat(event.pressure))
-            return event
-        }
-    }
-
-    override func touchesBegan(with event: NSEvent)     { processEvent(event) }
-    override func touchesMoved(with event: NSEvent)     { processEvent(event) }
-    override func touchesEnded(with event: NSEvent)     { processEvent(event) }
-    override func touchesCancelled(with event: NSEvent) { processEvent(event) }
-
-    private func processEvent(_ event: NSEvent) {
-        let allPhases: NSTouch.Phase = [.touching, .ended, .cancelled]
-        let touches = Array(event.touches(matching: allPhases, in: self))
-        session?.update(touches: touches, timestamp: event.timestamp)
-    }
-}
