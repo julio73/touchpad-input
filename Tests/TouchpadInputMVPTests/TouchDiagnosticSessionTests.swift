@@ -28,6 +28,67 @@ struct MTContact {
     var zDensity:       Float
 }
 
+struct KeyZone {
+    let character: Character
+    let xMin, xMax: Float
+    let yMin, yMax: Float
+}
+
+struct KeyGrid {
+    let zones: [KeyZone]
+
+    func zone(at x: Float, y: Float) -> KeyZone? {
+        zones.first { z in x >= z.xMin && x < z.xMax && y >= z.yMin && y < z.yMax }
+    }
+
+    static let `default`: KeyGrid = {
+        let cols: [(xMin: Float, xMax: Float)] = (0..<10).map { i in
+            let xMin: Float = 0.020 + Float(i) * 0.096
+            return (xMin, xMin + 0.096)
+        }
+        let topRow:    [Character] = ["q","w","e","r","t","y","u","i","o","p"]
+        let homeRow:   [Character] = ["a","s","d","f","g","h","j","k","l",";"]
+        let bottomRow: [Character] = ["z","x","c","v","b","n","m",",",".","/"]
+
+        var zones: [KeyZone] = []
+        for (i, ch) in topRow.enumerated() {
+            zones.append(KeyZone(character: ch,
+                                 xMin: cols[i].xMin, xMax: cols[i].xMax,
+                                 yMin: 0.65, yMax: 1.0))
+        }
+        for (i, ch) in homeRow.enumerated() {
+            zones.append(KeyZone(character: ch,
+                                 xMin: cols[i].xMin, xMax: cols[i].xMax,
+                                 yMin: 0.30, yMax: 0.65))
+        }
+        for (i, ch) in bottomRow.enumerated() {
+            zones.append(KeyZone(character: ch,
+                                 xMin: cols[i].xMin, xMax: cols[i].xMax,
+                                 yMin: 0.08, yMax: 0.30))
+        }
+        zones.append(KeyZone(character: " ",
+                             xMin: 0.02, xMax: 0.98,
+                             yMin: 0.00, yMax: 0.08))
+        return KeyGrid(zones: zones)
+    }()
+}
+
+final class CharacterEmitter {
+    let grid: KeyGrid
+
+    init(grid: KeyGrid = .default) { self.grid = grid }
+
+    func characterForTouch(at x: Float, y: Float, pressure: Float) -> Character? {
+        guard pressure >= 0.30 else { return nil }
+        guard let zone = grid.zone(at: x, y: y) else { return nil }
+        if pressure >= 0.70 {
+            return Character(String(zone.character).uppercased())
+        } else {
+            return zone.character
+        }
+    }
+}
+
 struct FingerState: Identifiable {
     let id: String
     let label: String
@@ -56,7 +117,9 @@ final class TouchDiagnosticSession: ObservableObject {
     @Published var liveFingers: [FingerState] = []
     @Published var eventLog: [TouchLogEntry] = []
     @Published var isActive: Bool = false
+    @Published var outputBuffer: String = ""
 
+    private let emitter = CharacterEmitter()
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
     private var labelCounter = 0
@@ -67,6 +130,7 @@ final class TouchDiagnosticSession: ObservableObject {
         var liveLookup: [String: FingerState] = Dictionary(
             uniqueKeysWithValues: liveFingers.map { ($0.id, $0) }
         )
+        var emittedZoneKeys: Set<String> = []
 
         // Synthesize "ended" for fingers that disappeared from the frame
         for id in Set(liveLookup.keys).subtracting(currentIDs) {
@@ -113,6 +177,18 @@ final class TouchDiagnosticSession: ObservableObject {
                 phase = "moved"
             }
 
+            if phase == "began" {
+                if let zone = emitter.grid.zone(at: Float(x), y: Float(y)) {
+                    let key = "\(zone.xMin)-\(zone.yMin)"
+                    if !emittedZoneKeys.contains(key) {
+                        emittedZoneKeys.insert(key)
+                        if let ch = emitter.characterForTouch(at: Float(x), y: Float(y), pressure: Float(pressure)) {
+                            outputBuffer.append(ch)
+                        }
+                    }
+                }
+            }
+
             if phase != "stationary" {
                 appendLog(TouchLogEntry(
                     timestamp: Date(), fingerLabel: label,
@@ -137,6 +213,7 @@ final class TouchDiagnosticSession: ObservableObject {
     func clearAll() {
         eventLog = []
         liveFingers = []
+        outputBuffer = ""
         fingerLabels = [:]
         fingerLastTime = [:]
         labelCounter = 0
@@ -342,5 +419,77 @@ final class LogCapTests: XCTestCase {
 
             XCTAssertEqual(session.eventLog.count, 500, "Event log should be capped at 500 entries")
         }
+    }
+}
+
+// MARK: - KeyGridTests
+
+final class KeyGridTests: XCTestCase {
+
+    let grid = KeyGrid.default
+
+    func testTopRowLookup() {
+        // x=0.05 → column 0 [0.020, 0.116); y=0.80 → top row [0.65, 1.0) → Q
+        let zone = grid.zone(at: 0.05, y: 0.80)
+        XCTAssertNotNil(zone)
+        XCTAssertEqual(zone?.character, "q")
+    }
+
+    func testHomeRowLookup() {
+        // x=0.05 → column 0; y=0.50 → home row [0.30, 0.65) → A
+        let zone = grid.zone(at: 0.05, y: 0.50)
+        XCTAssertNotNil(zone)
+        XCTAssertEqual(zone?.character, "a")
+    }
+
+    func testBottomRowLookup() {
+        // x=0.05 → column 0; y=0.20 → bottom row [0.08, 0.30) → Z
+        let zone = grid.zone(at: 0.05, y: 0.20)
+        XCTAssertNotNil(zone)
+        XCTAssertEqual(zone?.character, "z")
+    }
+
+    func testSpaceBarLookup() {
+        // x=0.50 ∈ [0.02, 0.98); y=0.04 ∈ [0.00, 0.08) → space
+        let zone = grid.zone(at: 0.50, y: 0.04)
+        XCTAssertNotNil(zone)
+        XCTAssertEqual(zone?.character, " ")
+    }
+
+    func testMarginMiss() {
+        // x=0.01 < 0.020 left margin → no zone
+        let zone = grid.zone(at: 0.01, y: 0.50)
+        XCTAssertNil(zone, "Touch in left margin should not match any zone")
+    }
+}
+
+// MARK: - CharacterEmitterTests
+
+final class CharacterEmitterTests: XCTestCase {
+
+    let emitter = CharacterEmitter()
+
+    func testLowPressureEmitsNil() {
+        // pressure < 0.30 → below threshold
+        let ch = emitter.characterForTouch(at: 0.05, y: 0.80, pressure: 0.10)
+        XCTAssertNil(ch, "Pressure below threshold should emit nil")
+    }
+
+    func testNormalPressureEmitsLowercase() {
+        // pressure=0.40 at Q zone → "q"
+        let ch = emitter.characterForTouch(at: 0.05, y: 0.80, pressure: 0.40)
+        XCTAssertEqual(ch, "q")
+    }
+
+    func testFirmPressureEmitsUppercase() {
+        // pressure=0.75 at Q zone → "Q"
+        let ch = emitter.characterForTouch(at: 0.05, y: 0.80, pressure: 0.75)
+        XCTAssertEqual(ch, "Q")
+    }
+
+    func testMissZoneEmitsNil() {
+        // x=0.01 is in left margin → no zone → nil regardless of pressure
+        let ch = emitter.characterForTouch(at: 0.01, y: 0.50, pressure: 0.50)
+        XCTAssertNil(ch, "Touch outside any zone should emit nil")
     }
 }

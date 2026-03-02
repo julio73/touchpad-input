@@ -227,7 +227,7 @@ struct KeyGrid {
 // MARK: - Character Emitter
 
 final class CharacterEmitter {
-    private let grid: KeyGrid
+    let grid: KeyGrid
 
     init(grid: KeyGrid = .default) {
         self.grid = grid
