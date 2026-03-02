@@ -1,346 +1,549 @@
 import AppKit
 import SwiftUI
+import Darwin
 
-// MARK: - Model
-@available(macOS 10.15, *)
-final class InputSession: ObservableObject {
-    @Published var outputText: String = ""
-    @Published var activeTouches: [TouchPoint] = []
-    @Published var lastKey: String = "-"
-    @Published var pressure: Double = 0
+// MARK: - MultitouchSupport private framework types
+// Layout mirrors the C struct in MultitouchSupport.framework.
+// If finger dots appear in wrong positions the struct layout has drifted —
+// file an issue and we'll adjust the padding/field order.
 
-    func appendCharacter(_ value: String) {
-        outputText += value
-        lastKey = value == " " ? "SPACE" : value
+struct MTVector { var x, y: Float }
+struct MTPoint  { var position, velocity: MTVector }
+struct MTContact {
+    var frame:          Int32   // offset 0
+    var timestamp:      Double  // offset 8  (4 bytes padding after frame)
+    var identifier:     Int32   // offset 16 — stable ID for this touch session
+    var state:          Int32   // offset 20 — raw hardware state
+    var fingerId:       Int32   // offset 24
+    var handId:         Int32   // offset 28
+    var normalized:     MTPoint // offset 32 — position + velocity, each 0…1
+    var size:           Float   // offset 48 — contact area
+    var unknown1:       Int32   // offset 52
+    var angle:          Float   // offset 56
+    var majorAxis:      Float   // offset 60
+    var minorAxis:      Float   // offset 64
+    var absoluteVector: MTPoint // offset 68
+    var unknown2:       (Int32, Int32) // offset 84
+    var zDensity:       Float   // offset 92 — pressure-like value
+}
+
+// C callback — cannot capture Swift context, routes through the singleton.
+// All parameters must be plain C types; use UnsafeRawPointer and rebind inside.
+private typealias MTCallbackFn = @convention(c) (
+    UnsafeRawPointer?,   // device (unused)
+    UnsafeRawPointer?,   // contacts array (rebound to MTContact inside)
+    Int32,               // count
+    Double,              // timestamp
+    Int32                // frame number (unused)
+) -> Void
+
+private let mtFrameCallback: MTCallbackFn = { _, rawPtr, count, timestamp, _ in
+    guard let rawPtr, count > 0 else { return }
+    let n = Int(count)
+    let contacts = rawPtr.withMemoryRebound(to: MTContact.self, capacity: n) { ptr in
+        Array(UnsafeBufferPointer(start: ptr, count: n))
     }
-
-    func deleteBackward() {
-        guard !outputText.isEmpty else { return }
-        outputText.removeLast()
-        lastKey = "DELETE"
-    }
-
-    func clear() {
-        outputText = ""
-        lastKey = "CLEAR"
+    DispatchQueue.main.async {
+        MultitouchCapture.shared.session?.update(mtContacts: contacts, timestamp: timestamp)
     }
 }
 
-struct TouchPoint: Identifiable {
-    let id: String
+// MARK: - MultitouchCapture
+
+final class MultitouchCapture: @unchecked Sendable {
+    static let shared = MultitouchCapture()
+
+    nonisolated(unsafe) weak var session: TouchDiagnosticSession?
+    private nonisolated(unsafe) var keyMonitor: Any?
+    private nonisolated(unsafe) var lastControlPressTime: TimeInterval = 0
+    private nonisolated(unsafe) var devices: [AnyObject] = []
+
+    private let lib = dlopen(
+        "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport",
+        RTLD_LAZY
+    )
+
+    // Call from onAppear — double-tap either Control key toggles capture
+    func setupDoubleControlToggle(for session: TouchDiagnosticSession) {
+        self.session = session
+        keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            guard let self else { return }
+            // keyCode 59 = left ctrl, 62 = right ctrl; only fire on key-down (flag present)
+            guard (event.keyCode == 59 || event.keyCode == 62),
+                  event.modifierFlags.contains(.control) else { return }
+            let now = event.timestamp
+            if now - self.lastControlPressTime < 0.35 {
+                self.lastControlPressTime = 0
+                DispatchQueue.main.async {
+                    guard let s = self.session else { return }
+                    if s.isActive { self.stop() } else { self.start(session: s) }
+                }
+            } else {
+                self.lastControlPressTime = now
+            }
+        }
+    }
+
+    // Call from onDisappear
+    func teardownDoubleControlToggle() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
+        lastControlPressTime = 0
+        stop()
+    }
+
+    func start(session: TouchDiagnosticSession) {
+        stopDevices()
+        self.session = session
+
+        guard let lib else {
+            print("[MT] could not open MultitouchSupport.framework")
+            return
+        }
+
+        typealias CreateListFn = @convention(c) () -> CFArray
+        typealias RegisterFn   = @convention(c) (UnsafeRawPointer, MTCallbackFn) -> Void
+        typealias StartFn      = @convention(c) (UnsafeRawPointer, Int32) -> Void
+
+        guard
+            let cs = dlsym(lib, "MTDeviceCreateList"),
+            let rs = dlsym(lib, "MTRegisterContactFrameCallback"),
+            let ss = dlsym(lib, "MTDeviceStart")
+        else {
+            print("[MT] could not resolve symbols")
+            return
+        }
+
+        let createList  = unsafeBitCast(cs, to: CreateListFn.self)
+        let registerCb  = unsafeBitCast(rs, to: RegisterFn.self)
+        let startDevice = unsafeBitCast(ss, to: StartFn.self)
+
+        devices = createList() as [AnyObject]
+        for device in devices {
+            let raw = Unmanaged.passUnretained(device).toOpaque()
+            registerCb(raw, mtFrameCallback)
+            startDevice(raw, 0)
+        }
+        session.isActive = true
+    }
+
+    func stop() {
+        session?.isActive = false
+        session?.liveFingers = []
+        stopDevices()
+    }
+
+    private func stopDevices() {
+        defer { devices = [] }
+        guard let lib, !devices.isEmpty else { return }
+        typealias StopFn = @convention(c) (UnsafeRawPointer) -> Void
+        guard let sym = dlsym(lib, "MTDeviceStop") else { return }
+        let stopDevice = unsafeBitCast(sym, to: StopFn.self)
+        for device in devices {
+            stopDevice(Unmanaged.passUnretained(device).toOpaque())
+        }
+    }
+}
+
+// MARK: - Data Model
+
+struct FingerState: Identifiable {
+    let id: String           // String(MTContact.identifier)
+    let label: String        // #1, #2, …
+    let x: CGFloat           // normalized 0…1
+    let y: CGFloat           // normalized 0…1
+    let pressure: CGFloat    // from zDensity, clamped 0…1
+    let phase: String
+    let lastEventTime: TimeInterval
+    let deltaMsFromPrev: Int?
+}
+
+struct TouchLogEntry: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let fingerLabel: String
+    let phase: String
     let x: CGFloat
     let y: CGFloat
+    let pressure: CGFloat
+    let deltaMs: Int?
+    let rawState: Int32      // raw MTContact.state — useful during Phase 1 exploration
 }
 
-struct KeyRegion: Identifiable {
-    let id: String
-    let label: String
-    let frame: CGRect
+final class TouchDiagnosticSession: ObservableObject {
+    @Published var liveFingers: [FingerState] = []
+    @Published var eventLog: [TouchLogEntry] = []
+    @Published var isActive: Bool = false
+
+    private var fingerLabels: [String: String] = [:]
+    private var fingerLastTime: [String: TimeInterval] = [:]
+    private var labelCounter = 0
+    private let maxLogEntries = 500
+
+    func update(mtContacts contacts: [MTContact], timestamp: Double) {
+        let currentIDs = Set(contacts.map { String($0.identifier) })
+        var liveLookup: [String: FingerState] = Dictionary(
+            uniqueKeysWithValues: liveFingers.map { ($0.id, $0) }
+        )
+
+        // Synthesize "ended" for fingers that disappeared from the frame
+        for id in Set(liveLookup.keys).subtracting(currentIDs) {
+            if let prev = liveLookup[id] {
+                appendLog(TouchLogEntry(
+                    timestamp: Date(), fingerLabel: prev.label,
+                    phase: "ended", x: prev.x, y: prev.y,
+                    pressure: prev.pressure, deltaMs: nil, rawState: -1
+                ))
+            }
+            liveLookup.removeValue(forKey: id)
+            fingerLastTime.removeValue(forKey: id)
+        }
+
+        // Update active contacts
+        for contact in contacts {
+            let rawID = String(contact.identifier)
+            let isNew = liveLookup[rawID] == nil
+
+            if fingerLabels[rawID] == nil {
+                labelCounter += 1
+                fingerLabels[rawID] = "#\(labelCounter)"
+            }
+            let label = fingerLabels[rawID]!
+
+            let deltaMs: Int?
+            if let prev = fingerLastTime[rawID] {
+                deltaMs = max(0, Int((timestamp - prev) * 1000))
+            } else {
+                deltaMs = nil
+            }
+
+            let x = CGFloat(contact.normalized.position.x)
+            let y = CGFloat(contact.normalized.position.y)
+            let pressure = CGFloat(min(max(contact.zDensity, 0), 1))
+
+            let phase: String
+            if isNew {
+                phase = "began"
+            } else if let prev = liveLookup[rawID],
+                      abs(prev.x - x) < 0.0005 && abs(prev.y - y) < 0.0005 {
+                phase = "stationary"
+            } else {
+                phase = "moved"
+            }
+
+            if phase != "stationary" {
+                appendLog(TouchLogEntry(
+                    timestamp: Date(), fingerLabel: label,
+                    phase: phase, x: x, y: y,
+                    pressure: pressure, deltaMs: deltaMs,
+                    rawState: contact.state
+                ))
+            }
+
+            fingerLastTime[rawID] = timestamp
+            liveLookup[rawID] = FingerState(
+                id: rawID, label: label,
+                x: x, y: y, pressure: pressure,
+                phase: phase, lastEventTime: timestamp,
+                deltaMsFromPrev: deltaMs
+            )
+        }
+
+        liveFingers = Array(liveLookup.values).sorted { $0.label < $1.label }
+    }
+
+    func clearAll() {
+        eventLog = []
+        liveFingers = []
+        fingerLabels = [:]
+        fingerLastTime = [:]
+        labelCounter = 0
+    }
+
+    private func appendLog(_ entry: TouchLogEntry) {
+        eventLog.append(entry)
+        if eventLog.count > maxLogEntries {
+            eventLog.removeFirst(eventLog.count - maxLogEntries)
+        }
+    }
 }
 
 // MARK: - SwiftUI Views
+
 #if canImport(SwiftUI)
-@available(macOS 10.15, *)
+
 struct ContentView: View {
-    @ObservedObject private var session = InputSession()
-    private let layout = KeyboardLayout.defaultLayout
+    @StateObject private var session = TouchDiagnosticSession()
 
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 0) {
             header
-            TouchCaptureRepresentable(layout: layout, session: session)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .modifier(TopLeadingOverlay(overlay: debugOverlay))
-                .background(backgroundColor)
-                .clipShape(RoundedRectangle(cornerRadius: 14))
-
-            outputArea
+            Divider()
+            HStack(spacing: 0) {
+                TrackpadSurface(fingers: session.liveFingers, isActive: session.isActive)
+                    .padding(16)
+                Divider()
+                FingerTablePanel(fingers: session.liveFingers)
+                    .frame(width: 340)
+            }
+            Divider()
+            EventLogPanel(entries: session.eventLog)
         }
-        .padding(16)
+        .onAppear  { MultitouchCapture.shared.setupDoubleControlToggle(for: session) }
+        .onDisappear { MultitouchCapture.shared.teardownDoubleControlToggle() }
     }
 
     private var header: some View {
-        HStack {
-            Text("Touchpad Input MVP")
-                .font(.system(size: 22, weight: .bold))
+        HStack(spacing: 10) {
+            Text("Touchpad Diagnostics")
+                .font(.system(size: 18, weight: .semibold))
+            modePill
             Spacer()
-            Button("Clear Output") { session.clear() }
+            Button("Clear") { session.clearAll() }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    private var modePill: some View {
+        Group {
+            if session.isActive {
+                Text("● CAPTURING  —  double ctrl to stop")
+                    .foregroundColor(.white)
+                    .background(Color.green)
+            } else {
+                Text("○ OFF  —  double ctrl to start")
+                    .foregroundColor(.secondary)
+                    .background(Color.secondary.opacity(0.12))
+            }
+        }
+        .font(.system(size: 11, weight: .medium, design: .monospaced))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+// MARK: - Trackpad Surface
+
+struct TrackpadSurface: View {
+    let fingers: [FingerState]
+    let isActive: Bool
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color(NSColor.controlBackgroundColor))
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(
+                        isActive ? Color.green.opacity(0.4) : Color.secondary.opacity(0.25),
+                        lineWidth: isActive ? 1.5 : 1
+                    )
+
+                if fingers.isEmpty {
+                    Text(isActive ? "Place fingers on trackpad" : "Double-tap ctrl to start")
+                        .font(.system(size: 14))
+                        .foregroundColor(.secondary)
+                }
+
+                ForEach(fingers) { finger in
+                    // trackpad y=0 is bottom; SwiftUI y=0 is top
+                    let x = finger.x * geo.size.width
+                    let y = (1.0 - finger.y) * geo.size.height
+                    ZStack {
+                        Circle()
+                            .fill(dotColor(finger.phase).opacity(0.75))
+                            .frame(width: 38, height: 38)
+                        Text(finger.label)
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+                    }
+                    .position(x: x, y: y)
+                }
+            }
         }
     }
 
-    private var debugOverlay: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Touches: \(session.activeTouches.count)")
-            Text("Last Key: \(session.lastKey)")
-            Text("Pressure: \(String(format: "%.2f", session.pressure))")
+    private func dotColor(_ phase: String) -> Color {
+        switch phase {
+        case "began": return .green
+        case "ended": return .red
+        default:      return .blue
         }
-        .font(.system(size: 13, weight: .semibold, design: .monospaced))
-        .padding(10)
-        .background(Color.black.opacity(0.08))
-        .cornerRadius(10)
-        .padding(12)
+    }
+}
+
+// MARK: - Finger Table Panel
+
+struct FingerTablePanel: View {
+    let fingers: [FingerState]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Live Fingers")
+                .font(.headline)
+                .padding(.horizontal, 16)
+                .padding(.top, 16)
+                .padding(.bottom, 10)
+
+            columnHeaders
+            Divider()
+            fingerRows
+            Spacer()
+        }
+    }
+
+    private var columnHeaders: some View {
+        HStack(spacing: 0) {
+            Text("ID")   .frame(width: 36,  alignment: .leading)
+            Text("X")    .frame(width: 88,  alignment: .trailing)
+            Text("Y")    .frame(width: 88,  alignment: .trailing)
+            Text("P")    .frame(width: 52,  alignment: .trailing)
+            Text("Phase").frame(width: 72,  alignment: .leading).padding(.leading, 12)
+        }
+        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+        .foregroundColor(.secondary)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
     }
 
     @ViewBuilder
-    private var outputArea: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Output")
-                .font(.headline)
-            if #available(macOS 11.0, *) {
-                TextEditor(text: Binding(get: { session.outputText }, set: { session.outputText = $0 }))
-                    .font(.system(size: 15, design: .monospaced))
-                    .frame(height: 180)
-                    .border(Color.secondary.opacity(0.3))
-            } else {
-                ScrollView {
-                    Text(session.outputText)
-                        .font(.system(size: 15, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
+    private var fingerRows: some View {
+        if fingers.isEmpty {
+            Text("— no active touches")
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+        } else {
+            ForEach(fingers) { f in
+                HStack(spacing: 0) {
+                    Text(f.label)
+                        .frame(width: 36, alignment: .leading)
+                    Text(String(format: "%.5f", f.x))
+                        .frame(width: 88, alignment: .trailing)
+                    Text(String(format: "%.5f", f.y))
+                        .frame(width: 88, alignment: .trailing)
+                    Text(String(format: "%.2f", f.pressure))
+                        .frame(width: 52, alignment: .trailing)
+                    Text(f.phase)
+                        .frame(width: 72, alignment: .leading)
+                        .padding(.leading, 12)
+                        .foregroundColor(phaseColor(f.phase))
                 }
-                .frame(height: 180)
-                .border(Color.secondary.opacity(0.3))
+                .font(.system(size: 12, design: .monospaced))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 4)
             }
         }
     }
 
-    private var backgroundColor: Color {
-        if #available(macOS 12.0, *) {
-            return Color(nsColor: .windowBackgroundColor)
-        } else {
-            return Color(NSColor.windowBackgroundColor)
+    private func phaseColor(_ phase: String) -> Color {
+        switch phase {
+        case "began": return .green
+        case "ended": return .red
+        case "moved": return .blue
+        default:      return .primary
         }
     }
 }
 
-@available(macOS 10.15, *)
-struct TopLeadingOverlay<Overlay: View>: ViewModifier {
-    let overlay: Overlay
-    func body(content: Content) -> some View {
-        if #available(macOS 12.0, *) {
-            content.overlay(alignment: .topLeading) { overlay }
-        } else {
-            content.overlay(
-                ZStack(alignment: .topLeading) { overlay }
-            )
+// MARK: - Event Log Panel
+
+struct EventLogPanel: View {
+    let entries: [TouchLogEntry]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Event Log")
+                    .font(.headline)
+                Spacer()
+                Text("\(entries.count) events")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+
+            Divider()
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 1) {
+                        ForEach(entries) { entry in
+                            EventLogRow(entry: entry)
+                                .id(entry.id)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 4)
+                }
+                .onChange(of: entries.count) { _ in
+                    if let last = entries.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
+            }
+        }
+        .frame(height: 190)
+        .background(Color(NSColor.textBackgroundColor))
+    }
+}
+
+struct EventLogRow: View {
+    let entry: TouchLogEntry
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(formattedTime)
+                .foregroundColor(.secondary)
+                .frame(width: 92, alignment: .leading)
+            Text(entry.phase)
+                .foregroundColor(phaseColor)
+                .frame(width: 65, alignment: .leading)
+            Text(entry.fingerLabel)
+                .frame(width: 28, alignment: .leading)
+            Text(String(format: "x=%.5f", entry.x))
+                .frame(width: 98, alignment: .leading)
+            Text(String(format: "y=%.5f", entry.y))
+                .frame(width: 98, alignment: .leading)
+            Text(String(format: "p=%.2f", entry.pressure))
+                .frame(width: 55, alignment: .leading)
+            if entry.rawState >= 0 {
+                Text("s\(entry.rawState)")
+                    .foregroundColor(.secondary)
+                    .frame(width: 28, alignment: .leading)
+            }
+            if let delta = entry.deltaMs {
+                Text("Δ\(delta)ms")
+                    .foregroundColor(.orange)
+            }
+        }
+        .font(.system(size: 11, design: .monospaced))
+        .padding(.vertical, 1)
+    }
+
+    private var formattedTime: String {
+        let cal = Calendar.current
+        let comps = cal.dateComponents([.hour, .minute, .second, .nanosecond], from: entry.timestamp)
+        let ms = (comps.nanosecond ?? 0) / 1_000_000
+        return String(format: "%02d:%02d:%02d.%03d",
+            comps.hour ?? 0, comps.minute ?? 0, comps.second ?? 0, ms)
+    }
+
+    private var phaseColor: Color {
+        switch entry.phase {
+        case "began":     return .green
+        case "ended":     return .red
+        case "moved":     return .blue
+        case "cancelled": return .orange
+        default:          return .primary
         }
     }
 }
 
-@available(macOS 10.15, *)
-struct TouchCaptureRepresentable: NSViewRepresentable {
-    let layout: KeyboardLayout
-    @ObservedObject var session: InputSession
-
-    func makeNSView(context: Context) -> TouchCaptureView {
-        let view = TouchCaptureView(frame: .zero)
-        view.layout = layout
-        view.session = session
-        return view
-    }
-
-    func updateNSView(_ nsView: TouchCaptureView, context: Context) {
-        nsView.layout = layout
-        nsView.session = session
-    }
-}
-#endif
-
-// MARK: - NSView implementation
-final class TouchCaptureView: NSView {
-    var layout: KeyboardLayout = .defaultLayout
-    weak var session: InputSession?
-
-    private var emittedForTouch: Set<String> = []
-    private var pressureObserver: Any?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        setup()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        setup()
-    }
-
-    deinit {
-        if let observer = pressureObserver {
-            NSEvent.removeMonitor(observer)
-        }
-    }
-
-    private func setup() {
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        allowedTouchTypes = [.direct, .indirect]
-
-        pressureObserver = NSEvent.addLocalMonitorForEvents(matching: .pressure) { [weak self] event in
-            self?.handlePressure(event)
-            return event
-        }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        drawKeyboardGrid()
-        drawTouchMarkers()
-    }
-
-    override func touchesBegan(with event: NSEvent) {
-        processTouches(event)
-    }
-
-    override func touchesMoved(with event: NSEvent) {
-        processTouches(event)
-    }
-
-    override func touchesEnded(with event: NSEvent) {
-        processTouches(event, resetEndedTouches: true)
-    }
-
-    override func touchesCancelled(with event: NSEvent) {
-        processTouches(event, resetEndedTouches: true)
-    }
-
-    private func handlePressure(_ event: NSEvent) {
-        if #available(macOS 10.15, *) {
-            session?.pressure = Double(event.pressure)
-            if event.pressure > 0.9 {
-                session?.deleteBackward()
-            }
-        }
-    }
-
-    private func processTouches(_ event: NSEvent, resetEndedTouches: Bool = false) {
-        let touches = event.touches(matching: .touching, in: self)
-        if resetEndedTouches {
-            let currentTouchIDs: Set<String> = Set(touches.map { touchIdentifier($0) })
-            emittedForTouch = emittedForTouch.intersection(currentTouchIDs)
-        }
-
-        var points: [TouchPoint] = []
-        for touch in touches {
-            let location = convertFromNormalized(touch.normalizedPosition)
-            let touchID = touchIdentifier(touch)
-            points.append(TouchPoint(id: String(describing: touchID), x: location.x, y: location.y))
-
-            if !emittedForTouch.contains(touchID), let key = keyLabel(at: location) {
-                emittedForTouch.insert(touchID)
-                emitKey(key)
-            }
-        }
-
-        if #available(macOS 10.15, *) {
-            session?.activeTouches = points
-        }
-        needsDisplay = true
-    }
-
-    private func touchIdentifier(_ touch: NSTouch) -> String {
-        String(describing: touch.identity)
-    }
-
-    private func convertFromNormalized(_ point: NSPoint) -> NSPoint {
-        NSPoint(x: bounds.width * point.x, y: bounds.height * point.y)
-    }
-
-    private func keyLabel(at point: NSPoint) -> String? {
-        layout.keyRegions(in: bounds).first(where: { $0.frame.contains(point) })?.label
-    }
-
-    private func emitKey(_ key: String) {
-        if #available(macOS 10.15, *) {
-            switch key {
-            case "SPACE":
-                session?.appendCharacter(" ")
-            case "DEL":
-                session?.deleteBackward()
-            default:
-                session?.appendCharacter(key.lowercased())
-            }
-        }
-    }
-
-    private func drawKeyboardGrid() {
-        NSColor.gridColor.withAlphaComponent(0.5).setStroke()
-        for region in layout.keyRegions(in: bounds) {
-            let path = NSBezierPath(roundedRect: region.frame.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6)
-            path.lineWidth = 1
-            path.stroke()
-
-            let attributes: [NSAttributedString.Key: Any]
-            if #available(macOS 10.15, *) {
-                attributes = [
-                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
-                    .foregroundColor: NSColor.secondaryLabelColor
-                ]
-            } else {
-                attributes = [
-                    .font: NSFont.systemFont(ofSize: 11),
-                    .foregroundColor: NSColor.secondaryLabelColor
-                ]
-            }
-            let text = NSAttributedString(string: region.label, attributes: attributes)
-            let textSize = text.size()
-            let textOrigin = NSPoint(
-                x: region.frame.midX - textSize.width / 2,
-                y: region.frame.midY - textSize.height / 2
-            )
-            text.draw(at: textOrigin)
-        }
-    }
-
-    private func drawTouchMarkers() {
-        NSColor.systemBlue.withAlphaComponent(0.8).setFill()
-        if let points = session?.activeTouches {
-            for point in points {
-                let marker = NSBezierPath(ovalIn: CGRect(x: point.x - 10, y: point.y - 10, width: 20, height: 20))
-                marker.fill()
-            }
-        }
-    }
-}
-
-// MARK: - Layout
-struct KeyboardLayout {
-    let rows: [[String]]
-
-    static let defaultLayout = KeyboardLayout(rows: [
-        ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
-        ["A", "S", "D", "F", "G", "H", "J", "K", "L", "DEL"],
-        ["Z", "X", "C", "V", "B", "N", "M", "SPACE"]
-    ])
-
-    func keyRegions(in bounds: CGRect) -> [KeyRegion] {
-        var regions: [KeyRegion] = []
-        guard !rows.isEmpty else { return regions }
-
-        let totalRows = CGFloat(rows.count)
-        let rowHeight = bounds.height / totalRows
-
-        for (rowIndex, row) in rows.enumerated() {
-            guard !row.isEmpty else { continue }
-
-            let y = bounds.height - (CGFloat(rowIndex + 1) * rowHeight)
-            let totalWeight = row.reduce(0.0) { partial, key in
-                partial + keyWidthWeight(key)
-            }
-
-            var x: CGFloat = 0
-            for key in row {
-                let width = bounds.width * (keyWidthWeight(key) / totalWeight)
-                let frame = CGRect(x: x, y: y, width: width, height: rowHeight)
-                regions.append(KeyRegion(id: "\(rowIndex)-\(key)", label: key, frame: frame))
-                x += width
-            }
-        }
-
-        return regions
-    }
-
-    private func keyWidthWeight(_ key: String) -> CGFloat {
-        if key == "SPACE" { return 3.0 }
-        if key == "DEL" { return 1.5 }
-        return 1.0
-    }
-}
+#endif // canImport(SwiftUI)
