@@ -9,6 +9,11 @@ let package = Package(
         .executableTarget(
             name: "TouchpadInputMVP",
             path: "Sources/TouchpadInputMVP"
+        ),
+        .testTarget(
+            name: "TouchpadInputMVPTests",
+            dependencies: [],
+            path: "Tests/TouchpadInputMVPTests"
         )
     ]
 )
