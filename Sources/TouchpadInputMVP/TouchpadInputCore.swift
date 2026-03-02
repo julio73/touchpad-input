@@ -252,7 +252,9 @@ final class TouchDiagnosticSession: ObservableObject {
     @Published var liveFingers: [FingerState] = []
     @Published var eventLog: [TouchLogEntry] = []
     @Published var isActive: Bool = false
+    @Published var outputBuffer: String = ""
 
+    private let emitter = CharacterEmitter()
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
     private var labelCounter = 0
@@ -263,6 +265,7 @@ final class TouchDiagnosticSession: ObservableObject {
         var liveLookup: [String: FingerState] = Dictionary(
             uniqueKeysWithValues: liveFingers.map { ($0.id, $0) }
         )
+        var emittedZoneKeys: Set<String> = []
 
         // Synthesize "ended" for fingers that disappeared from the frame
         for id in Set(liveLookup.keys).subtracting(currentIDs) {
@@ -309,6 +312,18 @@ final class TouchDiagnosticSession: ObservableObject {
                 phase = "moved"
             }
 
+            if phase == "began" {
+                if let zone = emitter.grid.zone(at: Float(x), y: Float(y)) {
+                    let key = "\(zone.xMin)-\(zone.yMin)"
+                    if !emittedZoneKeys.contains(key) {
+                        emittedZoneKeys.insert(key)
+                        if let ch = emitter.characterForTouch(at: Float(x), y: Float(y), pressure: Float(pressure)) {
+                            outputBuffer.append(ch)
+                        }
+                    }
+                }
+            }
+
             if phase != "stationary" {
                 appendLog(TouchLogEntry(
                     timestamp: Date(), fingerLabel: label,
@@ -333,6 +348,7 @@ final class TouchDiagnosticSession: ObservableObject {
     func clearAll() {
         eventLog = []
         liveFingers = []
+        outputBuffer = ""
         fingerLabels = [:]
         fingerLastTime = [:]
         labelCounter = 0
