@@ -58,17 +58,22 @@ As a user, I can place multiple fingers on the MacBook trackpad and produce lett
 
 ## Current Status
 
-- [x] MVP plan defined.
-- [x] App shell implemented (prototype).
-- [x] Touch capture wired (prototype).
-- [x] Mapping and output buffer wired (prototype).
-- [x] Pressure behavior wired (prototype).
+- [x] M1: Touch capture working (MultitouchSupport bridge, live finger dots, event log)
+- [ ] M2: Character emission (touch-to-key mapping, output buffer)
+- [ ] M3: Multi-touch + pressure handling
+- [ ] M4: Stability pass
 
-## Run (planned)
+## Run
 
-After initial scaffold lands:
+Requirements: macOS 11+, Xcode command-line tools or full Xcode.
 
 ```bash
 swift build
 swift run
 ```
+
+**Accessibility permission required:** On first launch, macOS will prompt for
+Accessibility access (needed for the global key monitor that toggles capture).
+Grant it in System Settings → Privacy & Security → Accessibility.
+
+Once running, double-tap either Control key to start/stop touch capture.
