@@ -320,3 +320,27 @@ final class FingerLifecycleTests: XCTestCase {
         }
     }
 }
+
+// MARK: - LogCapTests
+
+@MainActor
+final class LogCapTests: XCTestCase {
+
+    func testLogCappedAt500() {
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+
+            // First call — "began" (logged)
+            // Subsequent 599 calls — move x by a small but above-threshold amount each time
+            // so every call after the first produces a "moved" entry.
+            // Total logged = 1 (began) + 599 (moved) = 600, but capped at 500.
+            for i in 0..<600 {
+                let x = Float(i) * 0.001          // each step is 0.001 > 0.0005 threshold
+                let contact = makeContact(id: 1, x: min(x, 0.999), y: 0.5)
+                session.update(mtContacts: [contact], timestamp: Double(i))
+            }
+
+            XCTAssertEqual(session.eventLog.count, 500, "Event log should be capped at 500 entries")
+        }
+    }
+}
