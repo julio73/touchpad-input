@@ -109,3 +109,123 @@ struct KeyGrid {
     static let `default`: KeyGrid
 }
 ```
+
+---
+
+## Character Emitter
+
+### `CharacterEmitter` Type
+
+```swift
+/// Translates "began" touch events into characters using a KeyGrid,
+/// applying pressure-based modifier logic.
+final class CharacterEmitter {
+    private let grid: KeyGrid
+
+    /// Accumulated output — exposed as @Published on TouchDiagnosticSession in M2.
+    var outputBuffer: String = ""
+
+    init(grid: KeyGrid = .default) { self.grid = grid }
+
+    /// Called for each contact whose phase is "began".
+    /// Returns the character to emit (possibly modified by pressure), or nil for a miss.
+    func characterForTouch(at x: Float, y: Float, pressure: Float) -> Character?
+}
+```
+
+### Emission Rules
+
+1. **Trigger phase**: emission fires **only on `"began"`** — the first frame a finger
+   appears. Subsequent `"moved"` or `"stationary"` events for the same finger do not
+   emit.
+2. **Zone lookup**: `grid.zone(at: x, y:)` is called with the contact's normalized
+   position. A `nil` result (miss zone) produces no output.
+3. **Pressure gate**: touches below `zDensity` 0.30 are ignored entirely (see Pressure
+   Thresholds below). This prevents phantom emissions from incidental brushing.
+4. **Pressure modifier**: the emitted character may be uppercased or altered based on
+   `zDensity` (see table below).
+5. **Output**: the character is appended to `CharacterEmitter.outputBuffer`.
+
+### Integration Point
+
+`TouchDiagnosticSession.update()` will be extended in M2 to call the emitter after
+phase detection:
+
+```swift
+// Inside update(), after phase is determined for a contact:
+if phase == "began" {
+    if let ch = emitter.characterForTouch(
+        at: Float(x), y: Float(y), pressure: Float(contact.zDensity)
+    ) {
+        outputBuffer.append(ch)   // outputBuffer is @Published on TouchDiagnosticSession
+    }
+}
+```
+
+`TouchDiagnosticSession` gains:
+- A `CharacterEmitter` instance property.
+- `@Published var outputBuffer: String = ""` — displayed in a new output text area in
+  `ContentView`.
+- `outputBuffer` is reset by `clearAll()`.
+
+---
+
+## Multi-Touch Disambiguation
+
+When two or more fingers touch down in the **same frame**, `update()` processes
+contacts in the order delivered by the hardware callback. To produce deterministic
+output when multiple fingers land in the same zone simultaneously:
+
+**Rule:** When multiple "began" contacts fall in the **same zone** within a single
+frame, only the contact with the **lowest `identifier` value** emits. All others are
+silently skipped for that frame.
+
+**Implementation sketch:**
+
+```swift
+var emittedZoneKeys: Set<String> = []   // "xMin-yMin" uniquely identifies a zone
+
+for contact in contacts {
+    guard phase(for: contact, in: liveLookup) == "began" else { continue }
+    guard let zone = grid.zone(at: Float(contact.normalized.position.x),
+                               y: Float(contact.normalized.position.y)) else { continue }
+    let key = "\(zone.xMin)-\(zone.yMin)"
+    guard !emittedZoneKeys.contains(key) else { continue }   // lower id arrived first
+    emittedZoneKeys.insert(key)
+    // emit character for this zone
+}
+```
+
+**Rationale:** The hardware assigns monotonically increasing identifiers within a
+session; contacts that arrive in the same callback frame are processed in array order
+(lower index = lower identifier in practice). Using the first-seen contact approximates
+"the intentional finger" when two fingers accidentally land on the same zone.
+
+---
+
+## Pressure Thresholds (`zDensity`)
+
+`zDensity` is clamped to 0…1 by `TouchDiagnosticSession`. Observed ranges on a
+standard MacBook trackpad during M1 diagnostics:
+
+- Feather/incidental contact: ~0.05–0.20
+- Normal tap: ~0.25–0.50
+- Deliberate press: ~0.55–0.80
+- Force-touch threshold: ~0.85+
+
+| `zDensity` range | Behavior |
+|------------------|----------|
+| 0.00 – 0.29      | **No emission** — below confidence threshold; touch ignored |
+| 0.30 – 0.69      | **Normal tap** — emit lowercase character from zone |
+| 0.70 – 0.84      | **Firm tap** — emit uppercase character (implicit Shift) |
+| 0.85 – 1.00      | **Force press** — emit alternate character (behavior TBD in M3) |
+
+> These thresholds are initial estimates. The `zDensity` histogram collected during
+> M1 testing should be used to calibrate final values. A per-user calibration UI is
+> a candidate feature for M4.
+
+### Shift and Modifier State (M3 Preview)
+
+Pressure-based Shift is stateless: each tap independently determines case from its
+own `zDensity`. There is no "hold Shift" state in M2. A dedicated modifier-hold
+mechanism (e.g., a thumb-corner zone held while other fingers tap) is deferred to M3.
