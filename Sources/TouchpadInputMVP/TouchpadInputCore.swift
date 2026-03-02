@@ -172,6 +172,82 @@ struct TouchLogEntry: Identifiable {
     let rawState: Int32      // raw MTContact.state — useful during Phase 1 exploration
 }
 
+// MARK: - Key Grid
+
+struct KeyZone {
+    let character: Character
+    let xMin, xMax: Float
+    let yMin, yMax: Float
+}
+
+struct KeyGrid {
+    let zones: [KeyZone]
+
+    func zone(at x: Float, y: Float) -> KeyZone? {
+        zones.first { z in x >= z.xMin && x < z.xMax && y >= z.yMin && y < z.yMax }
+    }
+
+    static let `default`: KeyGrid = {
+        // 10 columns: xMin for column i = 0.020 + i * 0.096, width 0.096
+        let cols: [(xMin: Float, xMax: Float)] = (0..<10).map { i in
+            let xMin: Float = 0.020 + Float(i) * 0.096
+            return (xMin, xMin + 0.096)
+        }
+
+        let topRow:    [Character] = ["q","w","e","r","t","y","u","i","o","p"]
+        let homeRow:   [Character] = ["a","s","d","f","g","h","j","k","l",";"]
+        let bottomRow: [Character] = ["z","x","c","v","b","n","m",",",".","/"]
+
+        var zones: [KeyZone] = []
+
+        for (i, ch) in topRow.enumerated() {
+            zones.append(KeyZone(character: ch,
+                                 xMin: cols[i].xMin, xMax: cols[i].xMax,
+                                 yMin: 0.65, yMax: 1.0))
+        }
+        for (i, ch) in homeRow.enumerated() {
+            zones.append(KeyZone(character: ch,
+                                 xMin: cols[i].xMin, xMax: cols[i].xMax,
+                                 yMin: 0.30, yMax: 0.65))
+        }
+        for (i, ch) in bottomRow.enumerated() {
+            zones.append(KeyZone(character: ch,
+                                 xMin: cols[i].xMin, xMax: cols[i].xMax,
+                                 yMin: 0.08, yMax: 0.30))
+        }
+        // Space bar: x ∈ [0.02, 0.98), y ∈ [0.00, 0.08)
+        zones.append(KeyZone(character: " ",
+                             xMin: 0.02, xMax: 0.98,
+                             yMin: 0.00, yMax: 0.08))
+
+        return KeyGrid(zones: zones)
+    }()
+}
+
+// MARK: - Character Emitter
+
+final class CharacterEmitter {
+    private let grid: KeyGrid
+
+    init(grid: KeyGrid = .default) {
+        self.grid = grid
+    }
+
+    /// Returns a character for a "began" touch, or nil if outside a zone or below pressure threshold.
+    /// - pressure < 0.30  → nil
+    /// - pressure 0.30–0.69 → lowercase character
+    /// - pressure ≥ 0.70  → uppercased character
+    func characterForTouch(at x: Float, y: Float, pressure: Float) -> Character? {
+        guard pressure >= 0.30 else { return nil }
+        guard let zone = grid.zone(at: x, y: y) else { return nil }
+        if pressure >= 0.70 {
+            return Character(String(zone.character).uppercased())
+        } else {
+            return zone.character
+        }
+    }
+}
+
 final class TouchDiagnosticSession: ObservableObject {
     @Published var liveFingers: [FingerState] = []
     @Published var eventLog: [TouchLogEntry] = []
