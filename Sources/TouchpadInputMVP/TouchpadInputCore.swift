@@ -381,6 +381,8 @@ struct ContentView: View {
                     .frame(width: 340)
             }
             Divider()
+            OutputBufferPanel(text: session.outputBuffer)
+            Divider()
             EventLogPanel(entries: session.eventLog)
         }
         .onAppear  { MultitouchCapture.shared.setupDoubleControlToggle(for: session) }
@@ -415,6 +417,32 @@ struct ContentView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
         .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+// MARK: - Output Buffer Panel
+
+struct OutputBufferPanel: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Output")
+                .font(.headline)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+            Divider()
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(text.isEmpty ? "Start typing…" : text)
+                    .font(.system(size: 16, design: .monospaced))
+                    .foregroundColor(text.isEmpty ? .secondary : .primary)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(height: 80)
+        .background(Color(NSColor.textBackgroundColor))
     }
 }
 
