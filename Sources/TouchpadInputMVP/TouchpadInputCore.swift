@@ -446,6 +446,38 @@ struct OutputBufferPanel: View {
     }
 }
 
+// MARK: - Key Grid Overlay
+
+struct KeyGridOverlay: View {
+    private let zones = KeyGrid.default.zones
+
+    var body: some View {
+        GeometryReader { geo in
+            // Zone outlines
+            Canvas { ctx, size in
+                for zone in zones {
+                    let rect = CGRect(
+                        x: CGFloat(zone.xMin) * size.width,
+                        y: (1.0 - CGFloat(zone.yMax)) * size.height,
+                        width: CGFloat(zone.xMax - zone.xMin) * size.width,
+                        height: CGFloat(zone.yMax - zone.yMin) * size.height
+                    )
+                    ctx.stroke(Path(rect), with: .color(.secondary.opacity(0.20)), lineWidth: 0.5)
+                }
+            }
+            // Character labels
+            ForEach(Array(zones.enumerated()), id: \.offset) { _, zone in
+                let cx = CGFloat((zone.xMin + zone.xMax) / 2) * geo.size.width
+                let cy = (1.0 - CGFloat((zone.yMin + zone.yMax) / 2)) * geo.size.height
+                Text(zone.character == " " ? "spc" : String(zone.character).uppercased())
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundColor(.secondary.opacity(0.55))
+                    .position(x: cx, y: cy)
+            }
+        }
+    }
+}
+
 // MARK: - Trackpad Surface
 
 struct TrackpadSurface: View {
@@ -463,10 +495,14 @@ struct TrackpadSurface: View {
                         lineWidth: isActive ? 1.5 : 1
                     )
 
-                if fingers.isEmpty {
-                    Text(isActive ? "Place fingers on trackpad" : "Double-tap ctrl to start")
+                KeyGridOverlay()
+
+                if !isActive {
+                    Text("Double-tap ctrl to start")
                         .font(.system(size: 14))
                         .foregroundColor(.secondary)
+                        .padding(8)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
                 }
 
                 ForEach(fingers) { finger in

@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "TouchpadInputMVP",
-    platforms: [.macOS(.v11)],
+    platforms: [.macOS(.v12)],
     dependencies: [],
     targets: [
         .executableTarget(
