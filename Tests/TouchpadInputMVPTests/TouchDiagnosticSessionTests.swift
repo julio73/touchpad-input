@@ -257,3 +257,66 @@ final class PhaseDetectionTests: XCTestCase {
         }
     }
 }
+
+// MARK: - FingerLifecycleTests
+
+@MainActor
+final class FingerLifecycleTests: XCTestCase {
+
+    func testFirstContactGetsLabel1() {
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            let contact = makeContact(id: 42)
+            session.update(mtContacts: [contact], timestamp: 1.0)
+
+            XCTAssertEqual(session.liveFingers.count, 1)
+            XCTAssertEqual(session.liveFingers[0].label, "#1")
+        }
+    }
+
+    func testSecondContactGetsLabel2() {
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            let contact1 = makeContact(id: 1, x: 0.3, y: 0.5)
+            let contact2 = makeContact(id: 2, x: 0.7, y: 0.5)
+            session.update(mtContacts: [contact1, contact2], timestamp: 1.0)
+
+            XCTAssertEqual(session.liveFingers.count, 2)
+            let labels = Set(session.liveFingers.map { $0.label })
+            XCTAssertTrue(labels.contains("#1"), "Expected label #1")
+            XCTAssertTrue(labels.contains("#2"), "Expected label #2")
+        }
+    }
+
+    func testDisappearedContactSynthesizesEnded() {
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            let contact = makeContact(id: 1)
+
+            session.update(mtContacts: [contact], timestamp: 1.0)
+            session.update(mtContacts: [], timestamp: 2.0)
+
+            let endedEntries = session.eventLog.filter { $0.phase == "ended" }
+            XCTAssertEqual(endedEntries.count, 1, "Expected one 'ended' entry when contact disappears")
+            XCTAssertTrue(session.liveFingers.isEmpty)
+        }
+    }
+
+    func testClearAllResetsState() {
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            let contact = makeContact(id: 1)
+            session.update(mtContacts: [contact], timestamp: 1.0)
+
+            session.clearAll()
+
+            XCTAssertTrue(session.liveFingers.isEmpty, "liveFingers should be empty after clearAll")
+            XCTAssertTrue(session.eventLog.isEmpty, "eventLog should be empty after clearAll")
+
+            // After clearAll, a new contact should receive label "#1" again
+            let newContact = makeContact(id: 99)
+            session.update(mtContacts: [newContact], timestamp: 2.0)
+            XCTAssertEqual(session.liveFingers[0].label, "#1", "Label counter should reset to #1 after clearAll")
+        }
+    }
+}
