@@ -108,3 +108,102 @@ Each call to `update(mtContacts:timestamp:)` (always on the main queue) does the
 4. **Log capping** — after appending a new `TouchLogEntry`, if `eventLog.count` exceeds 500 the oldest entries are trimmed: `eventLog.removeFirst(eventLog.count - maxLogEntries)`.
 
 5. **State publication** — `liveFingers` is replaced with the updated dictionary values, sorted lexicographically by label so the table renders in a stable order.
+
+---
+
+## SwiftUI View Hierarchy
+
+```
+ContentView
+├── header (HStack)
+│   ├── Text "Touchpad Diagnostics"  — app title
+│   ├── modePill                     — status badge: "● CAPTURING" or "○ OFF"
+│   ├── Spacer
+│   └── Button "Clear"               — calls session.clearAll()
+├── Divider
+├── HStack
+│   ├── TrackpadSurface              — live trackpad canvas (GeometryReader + ZStack)
+│   │   ├── RoundedRectangle (fill)  — background panel; border turns green when active
+│   │   ├── Text (placeholder)       — shown only when no fingers are detected
+│   │   └── ForEach FingerState      — one Circle + label Text per live touch
+│   ├── Divider
+│   └── FingerTablePanel             — tabular live finger data (width: 340 pt)
+│       ├── Text "Live Fingers"      — section heading
+│       ├── columnHeaders            — ID / X / Y / P / Phase labels
+│       ├── Divider
+│       └── fingerRows               — one HStack row per FingerState, or placeholder text
+├── Divider
+└── EventLogPanel                    — scrollable timestamped event history (height: 190 pt)
+    ├── header HStack                — "Event Log" title + event count badge
+    ├── Divider
+    └── ScrollViewReader
+        └── ScrollView
+            └── LazyVStack
+                └── ForEach TouchLogEntry — EventLogRow per entry; auto-scrolls to bottom
+```
+
+### View Roles
+
+- **ContentView** — root view; owns the `@StateObject` session and wires `onAppear`/`onDisappear` to the `MultitouchCapture` toggle lifecycle.
+- **TrackpadSurface** — renders finger dots as `Circle` views positioned using normalized (0...1) coordinates. The trackpad y-axis is inverted relative to SwiftUI (trackpad y=0 is the bottom), so the view applies `(1.0 - finger.y)` to flip it. Dot color indicates phase: green = began, blue = moved/stationary, red = ended.
+- **FingerTablePanel** — shows a live table of all active `FingerState` entries with columns for label, x, y, pressure, and phase. Phase text is color-coded to match the dot colors.
+- **EventLogPanel** — renders `TouchLogEntry` items in a `LazyVStack` inside a `ScrollView`. An `onChange(of: entries.count)` observer automatically scrolls to the latest entry. The panel is fixed height so it does not crowd the trackpad canvas.
+
+---
+
+## Toggle Mechanism
+
+The user starts and stops touch capture by double-tapping either Control key (left = keyCode 59, right = keyCode 62).
+
+`NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged)` registers a system-wide event listener. The handler fires on every modifier key change. It filters for Control key-down events (flag present) and checks whether two such events arrived within a **350 ms window**:
+
+```swift
+if now - self.lastControlPressTime < 0.35 {
+    // double-tap confirmed — toggle capture
+    self.lastControlPressTime = 0
+    ...
+} else {
+    self.lastControlPressTime = now
+}
+```
+
+On a confirmed double-tap, the handler dispatches to the main queue and calls either `MultitouchCapture.start(session:)` or `MultitouchCapture.stop()` depending on `session.isActive`. The monitor is installed in `setupDoubleControlToggle(for:)` and removed in `teardownDoubleControlToggle()`, which are called from `ContentView.onAppear` and `onDisappear` respectively.
+
+---
+
+## Data Flow Diagram
+
+```
+┌────────────────────────────────────────────────────────┐
+│                      Hardware                          │
+│           MacBook Force Touch Trackpad                 │
+└───────────────────────┬────────────────────────────────┘
+                        │  raw contact frame (C struct array)
+                        ▼
+┌────────────────────────────────────────────────────────┐
+│            MultitouchSupport.framework                 │
+│  MTRegisterContactFrameCallback → mtFrameCallback()    │
+│  (called on a private framework thread)                │
+└───────────────────────┬────────────────────────────────┘
+                        │  DispatchQueue.main.async
+                        │  [MTContact] + timestamp
+                        ▼
+┌────────────────────────────────────────────────────────┐
+│              MultitouchCapture.shared                  │
+│  routes to session?.update(mtContacts:timestamp:)      │
+└───────────────────────┬────────────────────────────────┘
+                        │  on main thread
+                        ▼
+┌────────────────────────────────────────────────────────┐
+│             TouchDiagnosticSession                     │
+│  phase detection → finger labeling → log capping       │
+│  @Published liveFingers  @Published eventLog           │
+└────────┬──────────────────────────┬────────────────────┘
+         │                          │
+         ▼                          ▼
+┌─────────────────┐      ┌──────────────────────────────┐
+│ TrackpadSurface │      │  FingerTablePanel             │
+│ + FingerDots    │      │  + EventLogPanel              │
+│ (SwiftUI views) │      │  (SwiftUI views)              │
+└─────────────────┘      └──────────────────────────────┘
+```
