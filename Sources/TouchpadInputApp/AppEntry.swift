@@ -1,10 +1,10 @@
 import AppKit
 import SwiftUI
+import TouchpadInputCore
 
-#if canImport(SwiftUI)
 @available(macOS 11.0, *)
 @main
-struct TouchpadInputMVPApp: App {
+struct TouchpadInputApp: App {
     var body: some Scene {
         WindowGroup("Touchpad Diagnostics") {
             ContentView()
@@ -15,4 +15,3 @@ struct TouchpadInputMVPApp: App {
         }
     }
 }
-#endif

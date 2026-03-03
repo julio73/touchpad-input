@@ -2,19 +2,25 @@
 import PackageDescription
 
 let package = Package(
-    name: "TouchpadInputMVP",
+    name: "touchpad-input",
     platforms: [.macOS(.v12)],
-    dependencies: [],
+    products: [
+        .library(name: "TouchpadInputCore", targets: ["TouchpadInputCore"]),
+    ],
     targets: [
+        .target(
+            name: "TouchpadInputCore",
+            path: "Sources/TouchpadInputCore"
+        ),
         .executableTarget(
-            name: "TouchpadInputMVP",
-            path: "Sources/TouchpadInputMVP"
+            name: "TouchpadInputApp",
+            dependencies: ["TouchpadInputCore"],
+            path: "Sources/TouchpadInputApp"
         ),
         .testTarget(
-            name: "TouchpadInputMVPTests",
-            dependencies: [],
-            path: "Tests/TouchpadInputMVPTests"
-        )
+            name: "TouchpadInputCoreTests",
+            dependencies: ["TouchpadInputCore"],
+            path: "Tests/TouchpadInputCoreTests"
+        ),
     ]
 )
-
