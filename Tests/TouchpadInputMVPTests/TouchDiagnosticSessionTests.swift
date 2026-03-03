@@ -30,6 +30,7 @@ struct MTContact {
 
 struct KeyZone {
     let character: Character
+    let altCharacter: Character?
     let xMin, xMax: Float
     let yMin, yMax: Float
 }
@@ -49,28 +50,49 @@ struct KeyGrid {
         let topRow:    [Character] = ["q","w","e","r","t","y","u","i","o","p"]
         let homeRow:   [Character] = ["a","s","d","f","g","h","j","k","l",";"]
         let bottomRow: [Character] = ["z","x","c","v","b","n","m",",",".","/"]
+        let topAlt:    [Character] = ["1","2","3","4","5","6","7","8","9","0"]
+        let homeAlt:   [Character] = ["!","@","#","$","%","^","&","*","(",")"]
+        let bottomAlt: [Character] = ["-","_","+","=","[","]","{","}","`","~"]
 
         var zones: [KeyZone] = []
-        for (i, ch) in topRow.enumerated() {
-            zones.append(KeyZone(character: ch,
+        for (i, (ch, alt)) in zip(topRow, topAlt).enumerated() {
+            zones.append(KeyZone(character: ch, altCharacter: alt,
                                  xMin: cols[i].xMin, xMax: cols[i].xMax,
                                  yMin: 0.65, yMax: 1.0))
         }
-        for (i, ch) in homeRow.enumerated() {
-            zones.append(KeyZone(character: ch,
+        for (i, (ch, alt)) in zip(homeRow, homeAlt).enumerated() {
+            zones.append(KeyZone(character: ch, altCharacter: alt,
                                  xMin: cols[i].xMin, xMax: cols[i].xMax,
                                  yMin: 0.30, yMax: 0.65))
         }
-        for (i, ch) in bottomRow.enumerated() {
-            zones.append(KeyZone(character: ch,
+        for (i, (ch, alt)) in zip(bottomRow, bottomAlt).enumerated() {
+            zones.append(KeyZone(character: ch, altCharacter: alt,
                                  xMin: cols[i].xMin, xMax: cols[i].xMax,
                                  yMin: 0.08, yMax: 0.30))
         }
-        zones.append(KeyZone(character: " ",
+        zones.append(KeyZone(character: " ", altCharacter: "\n",
                              xMin: 0.02, xMax: 0.98,
                              yMin: 0.00, yMax: 0.08))
         return KeyGrid(zones: zones)
     }()
+}
+
+enum ModifierKind: Hashable { case shift, delete }
+
+struct ModifierZone {
+    let kind: ModifierKind
+    let label: String
+    let xMin, xMax: Float
+    let yMin, yMax: Float
+
+    func contains(x: Float, y: Float) -> Bool {
+        x >= xMin && x < xMax && y >= yMin && y < yMax
+    }
+
+    static let all: [ModifierZone] = [
+        ModifierZone(kind: .shift,  label: "⇧", xMin: 0.00, xMax: 0.05, yMin: 0.00, yMax: 0.12),
+        ModifierZone(kind: .delete, label: "⌫", xMin: 0.95, xMax: 1.00, yMin: 0.00, yMax: 0.12),
+    ]
 }
 
 final class CharacterEmitter {
@@ -81,7 +103,9 @@ final class CharacterEmitter {
     func characterForTouch(at x: Float, y: Float, pressure: Float) -> Character? {
         guard pressure >= 0.30 else { return nil }
         guard let zone = grid.zone(at: x, y: y) else { return nil }
-        if pressure >= 0.70 {
+        if pressure >= 0.85 {
+            return zone.altCharacter ?? Character(String(zone.character).uppercased())
+        } else if pressure >= 0.70 {
             return Character(String(zone.character).uppercased())
         } else {
             return zone.character
@@ -118,14 +142,23 @@ final class TouchDiagnosticSession: ObservableObject {
     @Published var eventLog: [TouchLogEntry] = []
     @Published var isActive: Bool = false
     @Published var outputBuffer: String = ""
+    @Published var activeModifiers: Set<ModifierKind> = []
 
     private let emitter = CharacterEmitter()
+    private let modifierZones = ModifierZone.all
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
     private var labelCounter = 0
     private let maxLogEntries = 500
 
     func update(mtContacts contacts: [MTContact], timestamp: Double) {
+        let heldModifiers: Set<ModifierKind> = Set(
+            modifierZones.compactMap { mz in
+                liveFingers.contains { mz.contains(x: Float($0.x), y: Float($0.y)) }
+                    ? mz.kind : nil
+            }
+        )
+
         let currentIDs = Set(contacts.map { String($0.identifier) })
         var liveLookup: [String: FingerState] = Dictionary(
             uniqueKeysWithValues: liveFingers.map { ($0.id, $0) }
@@ -178,12 +211,23 @@ final class TouchDiagnosticSession: ObservableObject {
             }
 
             if phase == "began" {
-                if let zone = emitter.grid.zone(at: Float(x), y: Float(y)) {
-                    let key = "\(zone.xMin)-\(zone.yMin)"
-                    if !emittedZoneKeys.contains(key) {
-                        emittedZoneKeys.insert(key)
-                        if let ch = emitter.characterForTouch(at: Float(x), y: Float(y), pressure: Float(pressure)) {
-                            outputBuffer.append(ch)
+                let fx = Float(x), fy = Float(y)
+                let isInModifierZone = modifierZones.contains { $0.contains(x: fx, y: fy) }
+                if !isInModifierZone {
+                    if heldModifiers.contains(.delete) {
+                        if !outputBuffer.isEmpty { outputBuffer.removeLast() }
+                    } else if let zone = emitter.grid.zone(at: fx, y: fy) {
+                        let key = "\(zone.xMin)-\(zone.yMin)"
+                        if !emittedZoneKeys.contains(key) {
+                            emittedZoneKeys.insert(key)
+                            var effectivePressure = Float(pressure)
+                            if heldModifiers.contains(.shift),
+                               effectivePressure >= 0.30, effectivePressure < 0.70 {
+                                effectivePressure = 0.70
+                            }
+                            if let ch = emitter.characterForTouch(at: fx, y: fy, pressure: effectivePressure) {
+                                outputBuffer.append(ch)
+                            }
                         }
                     }
                 }
@@ -208,12 +252,14 @@ final class TouchDiagnosticSession: ObservableObject {
         }
 
         liveFingers = Array(liveLookup.values).sorted { $0.label < $1.label }
+        activeModifiers = heldModifiers
     }
 
     func clearAll() {
         eventLog = []
         liveFingers = []
         outputBuffer = ""
+        activeModifiers = []
         fingerLabels = [:]
         fingerLastTime = [:]
         labelCounter = 0
@@ -491,5 +537,108 @@ final class CharacterEmitterTests: XCTestCase {
         // x=0.01 is in left margin → no zone → nil regardless of pressure
         let ch = emitter.characterForTouch(at: 0.01, y: 0.50, pressure: 0.50)
         XCTAssertNil(ch, "Touch outside any zone should emit nil")
+    }
+}
+
+// MARK: - ForcePressTests
+
+final class ForcePressTests: XCTestCase {
+
+    let emitter = CharacterEmitter()
+
+    func testForcePressEmitsAltChar() {
+        // Q zone (x=0.05, y=0.80), force-press → alt char "1"
+        let ch = emitter.characterForTouch(at: 0.05, y: 0.80, pressure: 0.90)
+        XCTAssertEqual(ch, "1")
+    }
+
+    func testForcePressSpaceEmitsNewline() {
+        // Space zone (x=0.50, y=0.04), force-press → "\n"
+        let ch = emitter.characterForTouch(at: 0.50, y: 0.04, pressure: 0.90)
+        XCTAssertEqual(ch, "\n")
+    }
+
+    func testForcePressHomeRowAlt() {
+        // A zone (x=0.05, y=0.50), force-press → "!"
+        let ch = emitter.characterForTouch(at: 0.05, y: 0.50, pressure: 0.88)
+        XCTAssertEqual(ch, "!")
+    }
+
+    func testBoundaryJustBelowForcePressIsUppercase() {
+        // pressure=0.84 is still uppercase range, not force-press → "Q"
+        let ch = emitter.characterForTouch(at: 0.05, y: 0.80, pressure: 0.84)
+        XCTAssertEqual(ch, "Q")
+    }
+}
+
+// MARK: - ModifierHoldTests
+
+@MainActor
+final class ModifierHoldTests: XCTestCase {
+
+    func testShiftHoldForcesUppercase() {
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            // Frame 1: place finger in shift zone (bottom-left: x=0.02, y=0.05)
+            let shiftFinger = makeContact(id: 1, x: 0.02, y: 0.05, pressure: 0.5)
+            session.update(mtContacts: [shiftFinger], timestamp: 1.0)
+            XCTAssertTrue(session.outputBuffer.isEmpty, "Shift zone tap should not emit a char")
+
+            // Frame 2: shift finger stationary + low-pressure tap at Q (x=0.05, y=0.80)
+            let qFinger = makeContact(id: 2, x: 0.05, y: 0.80, pressure: 0.40)
+            session.update(mtContacts: [shiftFinger, qFinger], timestamp: 2.0)
+
+            XCTAssertEqual(session.outputBuffer, "Q",
+                           "Shift-hold should force uppercase despite low pressure")
+            XCTAssertTrue(session.activeModifiers.contains(.shift))
+        }
+    }
+
+    func testDeleteHoldRemovesLastChar() {
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            // Frame 1: type "q"
+            let qFinger = makeContact(id: 1, x: 0.05, y: 0.80, pressure: 0.40)
+            session.update(mtContacts: [qFinger], timestamp: 1.0)
+            XCTAssertEqual(session.outputBuffer, "q")
+
+            // Frame 2: release q, place finger in delete zone (bottom-right: x=0.97, y=0.05)
+            let delFinger = makeContact(id: 2, x: 0.97, y: 0.05, pressure: 0.5)
+            session.update(mtContacts: [delFinger], timestamp: 2.0)
+            XCTAssertEqual(session.outputBuffer, "q", "Delete zone tap alone should not remove char yet")
+
+            // Frame 3: delete finger stationary + new tap anywhere → should remove "q"
+            let anyFinger = makeContact(id: 3, x: 0.50, y: 0.50, pressure: 0.40)
+            session.update(mtContacts: [delFinger, anyFinger], timestamp: 3.0)
+
+            XCTAssertEqual(session.outputBuffer, "",
+                           "Delete-hold + any tap should remove last char")
+            XCTAssertTrue(session.activeModifiers.contains(.delete))
+        }
+    }
+
+    func testModifierZoneTapDoesNotEmitChar() {
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            // Touching the shift zone directly should not produce output
+            let shiftFinger = makeContact(id: 1, x: 0.02, y: 0.05, pressure: 0.5)
+            session.update(mtContacts: [shiftFinger], timestamp: 1.0)
+            XCTAssertTrue(session.outputBuffer.isEmpty,
+                          "Tapping a modifier zone should not emit any character")
+        }
+    }
+
+    func testClearAllResetsModifiers() {
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            // Simulate modifier being active by placing finger in shift zone for two frames
+            let shiftFinger = makeContact(id: 1, x: 0.02, y: 0.05, pressure: 0.5)
+            session.update(mtContacts: [shiftFinger], timestamp: 1.0)
+            session.update(mtContacts: [shiftFinger], timestamp: 2.0)
+            XCTAssertTrue(session.activeModifiers.contains(.shift))
+
+            session.clearAll()
+            XCTAssertTrue(session.activeModifiers.isEmpty, "clearAll should reset activeModifiers")
+        }
     }
 }
