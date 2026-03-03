@@ -322,6 +322,23 @@ struct ModifierZone {
     ]
 }
 
+// MARK: - Autocomplete Engine
+
+final class AutocompleteEngine {
+    /// Returns up to 3 completions for the given partial word using NSSpellChecker.
+    func completions(forPartial partial: String) -> [String] {
+        guard !partial.isEmpty else { return [] }
+        let range = NSRange(location: 0, length: (partial as NSString).length)
+        let all: [String] = NSSpellChecker.shared.completions(
+            forPartialWordRange: range,
+            in: partial,
+            language: nil,
+            inSpellDocumentWithTag: 0
+        ) ?? []
+        return Array(all.prefix(3))
+    }
+}
+
 // MARK: - Calibration Session
 
 /// Drives the first-run calibration flow. Presents one target character at a time;
@@ -422,10 +439,14 @@ final class TouchDiagnosticSession: ObservableObject {
     // MARK: Calibration
     @Published var userCalibration: UserCalibration = .empty
 
+    // MARK: Autocomplete
+    @Published var completions: [String] = []
+
     // Set by CalibrationModal to intercept touches during the calibration flow.
     weak var activeCalibrationSession: CalibrationSession?
 
     private var emitter: CharacterEmitter
+    private let autocompleteEngine = AutocompleteEngine()
     private let modifierZones = ModifierZone.all
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
@@ -452,6 +473,25 @@ final class TouchDiagnosticSession: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "userCalibration")
     }
 
+    /// The partial word currently being typed (text after the last space/newline).
+    var currentPartialWord: String {
+        if let lastSep = outputBuffer.lastIndex(where: { $0 == " " || $0 == "\n" }) {
+            return String(outputBuffer[outputBuffer.index(after: lastSep)...])
+        }
+        return outputBuffer
+    }
+
+    /// Replace the current partial word with the accepted completion and append a space.
+    func acceptCompletion(_ word: String) {
+        if let lastSep = outputBuffer.lastIndex(where: { $0 == " " || $0 == "\n" }) {
+            let prefix = String(outputBuffer[...lastSep])
+            outputBuffer = prefix + word + " "
+        } else {
+            outputBuffer = word + " "
+        }
+        completions = []
+    }
+
     func update(mtContacts contacts: [MTContact], timestamp: Double) {
         // Detect modifiers held from the *previous* frame before any new contacts are processed.
         let heldModifiers: Set<ModifierKind> = Set(
@@ -465,6 +505,18 @@ final class TouchDiagnosticSession: ObservableObject {
         var liveLookup: [String: FingerState] = Dictionary(
             uniqueKeysWithValues: liveFingers.map { ($0.id, $0) }
         )
+
+        // Two-finger tap: accept top autocomplete suggestion.
+        // Only fires when no existing touches are present and we're not in delete mode.
+        let newContactIDs = currentIDs.subtracting(Set(liveLookup.keys))
+        let twoFingerTapAccepted: Bool
+        if newContactIDs.count >= 2 && liveLookup.isEmpty
+            && !completions.isEmpty && !heldModifiers.contains(.delete) {
+            acceptCompletion(completions[0])
+            twoFingerTapAccepted = true
+        } else {
+            twoFingerTapAccepted = false
+        }
 
         var emittedZoneKeys: Set<String> = []
 
@@ -513,7 +565,7 @@ final class TouchDiagnosticSession: ObservableObject {
                 phase = "moved"
             }
 
-            if phase == "began" {
+            if phase == "began" && !twoFingerTapAccepted {
                 let fx = Float(x), fy = Float(y)
 
                 if let calSession = activeCalibrationSession {
@@ -529,6 +581,7 @@ final class TouchDiagnosticSession: ObservableObject {
                         if heldModifiers.contains(.delete) {
                             // Delete-hold: any tap outside modifier zones removes last char
                             if !outputBuffer.isEmpty { outputBuffer.removeLast() }
+                            completions = autocompleteEngine.completions(forPartial: currentPartialWord)
                         } else if let zone = emitter.grid.zone(at: fx, y: fy) {
                             let key = "\(zone.xMin)-\(zone.yMin)"
                             if !emittedZoneKeys.contains(key) {
@@ -567,6 +620,10 @@ final class TouchDiagnosticSession: ObservableObject {
                                             grid: KeyGrid.default.applying(calibration: userCalibration)
                                         )
 
+                                        // Update autocomplete completions
+                                        completions = autocompleteEngine.completions(
+                                            forPartial: currentPartialWord
+                                        )
                                     }
                                 }
                             }
@@ -603,6 +660,7 @@ final class TouchDiagnosticSession: ObservableObject {
         liveFingers = []
         outputBuffer = ""
         activeModifiers = []
+        completions = []
         fingerLabels = [:]
         fingerLastTime = [:]
         lastZoneEmitTime = [:]
@@ -669,6 +727,33 @@ struct SettingsPanel: View {
                 .frame(width: 44, alignment: .trailing)
                 .font(.system(size: 12, design: .monospaced))
         }
+    }
+}
+
+// MARK: - Autocomplete Bar
+
+struct AutocompleteBar: View {
+    let completions: [String]
+    let onAccept: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("Suggestions:")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+            ForEach(Array(completions.enumerated()), id: \.offset) { _, word in
+                Button(word) { onAccept(word) }
+                    .buttonStyle(.bordered)
+                    .font(.system(size: 12))
+            }
+            Spacer()
+            Text("2-finger tap to accept first")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary.opacity(0.6))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(Color(NSColor.controlBackgroundColor))
     }
 }
 
@@ -766,6 +851,12 @@ struct ContentView: View {
                     calibSession.reset()
                     showCalibration = true
                 })
+            }
+            if !session.completions.isEmpty {
+                Divider()
+                AutocompleteBar(completions: session.completions) { word in
+                    session.acceptCompletion(word)
+                }
             }
             Divider()
             HStack(spacing: 0) {
