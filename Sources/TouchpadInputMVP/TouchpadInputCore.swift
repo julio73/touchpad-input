@@ -403,6 +403,9 @@ final class TouchDiagnosticSession: ObservableObject {
                                 ) {
                                     outputBuffer.append(ch)
                                     lastZoneEmitTime[key] = timestamp
+                                    // Haptic feedback — silent click feel
+                                    NSHapticFeedbackManager.defaultPerformer
+                                        .perform(.generic, performanceTime: .default)
                                 }
                             }
                         }
