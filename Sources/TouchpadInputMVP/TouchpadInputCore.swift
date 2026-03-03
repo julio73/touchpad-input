@@ -362,8 +362,12 @@ final class TouchDiagnosticSession: ObservableObject {
 
             if phase == "began" {
                 let fx = Float(x), fy = Float(y)
-                let isInModifierZone = modifierZones.contains { $0.contains(x: fx, y: fy) }
-                if !isInModifierZone {
+                // Suppress "began" only for modifier zones that are NOT already held.
+                // Once a modifier is held, any new "began" — even inside that zone — fires the action.
+                let isInUnheldModifierZone = modifierZones.contains { mz in
+                    !heldModifiers.contains(mz.kind) && mz.contains(x: fx, y: fy)
+                }
+                if !isInUnheldModifierZone {
                     if heldModifiers.contains(.delete) {
                         // Delete-hold: any tap outside modifier zones removes last char
                         if !outputBuffer.isEmpty { outputBuffer.removeLast() }
