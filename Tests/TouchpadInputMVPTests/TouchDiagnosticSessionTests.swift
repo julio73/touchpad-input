@@ -100,8 +100,8 @@ final class CharacterEmitter {
 
     init(grid: KeyGrid = .default) { self.grid = grid }
 
-    func characterForTouch(at x: Float, y: Float, pressure: Float) -> Character? {
-        guard pressure >= 0.30 else { return nil }
+    func characterForTouch(at x: Float, y: Float, pressure: Float, pressureFloor: Float = 0.30) -> Character? {
+        guard pressure >= pressureFloor else { return nil }
         guard let zone = grid.zone(at: x, y: y) else { return nil }
         if pressure >= 0.85 {
             return zone.altCharacter ?? Character(String(zone.character).uppercased())
@@ -119,6 +119,7 @@ struct FingerState: Identifiable {
     let x: CGFloat
     let y: CGFloat
     let pressure: CGFloat
+    let size: CGFloat
     let phase: String
     let lastEventTime: TimeInterval
     let deltaMsFromPrev: Int?
@@ -144,10 +145,15 @@ final class TouchDiagnosticSession: ObservableObject {
     @Published var outputBuffer: String = ""
     @Published var activeModifiers: Set<ModifierKind> = []
 
+    var pressureFloor: Float = 0.30
+    var minContactSize: Float = 0.0
+    var zoneCooldownMs: Double = 80.0
+
     private let emitter = CharacterEmitter()
     private let modifierZones = ModifierZone.all
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
+    private var lastZoneEmitTime: [String: Double] = [:]
     private var labelCounter = 0
     private let maxLogEntries = 500
 
@@ -222,13 +228,22 @@ final class TouchDiagnosticSession: ObservableObject {
                         let key = "\(zone.xMin)-\(zone.yMin)"
                         if !emittedZoneKeys.contains(key) {
                             emittedZoneKeys.insert(key)
-                            var effectivePressure = Float(pressure)
-                            if heldModifiers.contains(.shift),
-                               effectivePressure >= 0.30, effectivePressure < 0.70 {
-                                effectivePressure = 0.70
-                            }
-                            if let ch = emitter.characterForTouch(at: fx, y: fy, pressure: effectivePressure) {
-                                outputBuffer.append(ch)
+                            let passesSize = contact.size >= minContactSize
+                            let timeSinceMs = (timestamp - (lastZoneEmitTime[key] ?? -999)) * 1000
+                            let passesCooldown = timeSinceMs >= zoneCooldownMs
+                            if passesSize && passesCooldown {
+                                var effectivePressure = Float(pressure)
+                                if heldModifiers.contains(.shift),
+                                   effectivePressure >= pressureFloor, effectivePressure < 0.70 {
+                                    effectivePressure = 0.70
+                                }
+                                if let ch = emitter.characterForTouch(
+                                    at: fx, y: fy, pressure: effectivePressure,
+                                    pressureFloor: pressureFloor
+                                ) {
+                                    outputBuffer.append(ch)
+                                    lastZoneEmitTime[key] = timestamp
+                                }
                             }
                         }
                     }
@@ -248,6 +263,7 @@ final class TouchDiagnosticSession: ObservableObject {
             liveLookup[rawID] = FingerState(
                 id: rawID, label: label,
                 x: x, y: y, pressure: pressure,
+                size: CGFloat(contact.size),
                 phase: phase, lastEventTime: timestamp,
                 deltaMsFromPrev: deltaMs
             )
@@ -264,6 +280,7 @@ final class TouchDiagnosticSession: ObservableObject {
         activeModifiers = []
         fingerLabels = [:]
         fingerLastTime = [:]
+        lastZoneEmitTime = [:]
         labelCounter = 0
     }
 
@@ -283,6 +300,7 @@ func makeContact(
     x: Float = 0.5,
     y: Float = 0.5,
     pressure: Float = 0.5,
+    size: Float = 0.0,
     state: Int32 = 4
 ) -> MTContact {
     let posVec = MTVector(x: x, y: y)
@@ -298,7 +316,7 @@ func makeContact(
         fingerId: 0,
         handId: 0,
         normalized: normalized,
-        size: 0,
+        size: size,
         unknown1: 0,
         angle: 0,
         majorAxis: 0,
@@ -641,6 +659,70 @@ final class ModifierHoldTests: XCTestCase {
 
             session.clearAll()
             XCTAssertTrue(session.activeModifiers.isEmpty, "clearAll should reset activeModifiers")
+        }
+    }
+}
+
+// MARK: - StabilityTests
+
+@MainActor
+final class StabilityTests: XCTestCase {
+
+    func testSmallContactDoesNotEmit() {
+        // Contact area below threshold → no emission
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            session.minContactSize = 0.30
+            let contact = makeContact(id: 1, x: 0.05, y: 0.80, pressure: 0.40, size: 0.10)
+            session.update(mtContacts: [contact], timestamp: 1.0)
+            XCTAssertTrue(session.outputBuffer.isEmpty, "Contact below min size should not emit")
+        }
+    }
+
+    func testLargeContactEmits() {
+        // Contact area above threshold → emits normally
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            session.minContactSize = 0.30
+            let contact = makeContact(id: 1, x: 0.05, y: 0.80, pressure: 0.40, size: 0.50)
+            session.update(mtContacts: [contact], timestamp: 1.0)
+            XCTAssertEqual(session.outputBuffer, "q", "Contact above min size should emit")
+        }
+    }
+
+    func testZoneCooldownPreventsRapidRepeat() {
+        // Second tap on same zone within cooldown window → suppressed
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            session.zoneCooldownMs = 200.0
+
+            let c1 = makeContact(id: 1, x: 0.05, y: 0.80, pressure: 0.40)
+            session.update(mtContacts: [c1], timestamp: 1.000)  // emits "q"
+            session.update(mtContacts: [], timestamp: 1.050)    // lift finger
+
+            let c2 = makeContact(id: 2, x: 0.05, y: 0.80, pressure: 0.40)
+            session.update(mtContacts: [c2], timestamp: 1.100)  // 100ms later — within 200ms cooldown
+
+            XCTAssertEqual(session.outputBuffer, "q",
+                           "Second tap within cooldown should be suppressed")
+        }
+    }
+
+    func testZoneCooldownAllowsAfterExpiry() {
+        // Second tap on same zone after cooldown expires → emits
+        MainActor.assumeIsolated {
+            let session = TouchDiagnosticSession()
+            session.zoneCooldownMs = 100.0
+
+            let c1 = makeContact(id: 1, x: 0.05, y: 0.80, pressure: 0.40)
+            session.update(mtContacts: [c1], timestamp: 1.000)  // emits "q"
+            session.update(mtContacts: [], timestamp: 1.050)    // lift finger
+
+            let c2 = makeContact(id: 2, x: 0.05, y: 0.80, pressure: 0.40)
+            session.update(mtContacts: [c2], timestamp: 1.200)  // 200ms later — past 100ms cooldown
+
+            XCTAssertEqual(session.outputBuffer, "qq",
+                           "Second tap after cooldown expiry should emit")
         }
     }
 }
