@@ -172,11 +172,89 @@ struct TouchLogEntry: Identifiable {
     let rawState: Int32      // raw MTContact.state — useful during Phase 1 exploration
 }
 
+// MARK: - Key Grid
+
+struct KeyZone {
+    let character: Character
+    let xMin, xMax: Float
+    let yMin, yMax: Float
+}
+
+struct KeyGrid {
+    let zones: [KeyZone]
+
+    func zone(at x: Float, y: Float) -> KeyZone? {
+        zones.first { z in x >= z.xMin && x < z.xMax && y >= z.yMin && y < z.yMax }
+    }
+
+    static let `default`: KeyGrid = {
+        // 10 columns: xMin for column i = 0.020 + i * 0.096, width 0.096
+        let cols: [(xMin: Float, xMax: Float)] = (0..<10).map { i in
+            let xMin: Float = 0.020 + Float(i) * 0.096
+            return (xMin, xMin + 0.096)
+        }
+
+        let topRow:    [Character] = ["q","w","e","r","t","y","u","i","o","p"]
+        let homeRow:   [Character] = ["a","s","d","f","g","h","j","k","l",";"]
+        let bottomRow: [Character] = ["z","x","c","v","b","n","m",",",".","/"]
+
+        var zones: [KeyZone] = []
+
+        for (i, ch) in topRow.enumerated() {
+            zones.append(KeyZone(character: ch,
+                                 xMin: cols[i].xMin, xMax: cols[i].xMax,
+                                 yMin: 0.65, yMax: 1.0))
+        }
+        for (i, ch) in homeRow.enumerated() {
+            zones.append(KeyZone(character: ch,
+                                 xMin: cols[i].xMin, xMax: cols[i].xMax,
+                                 yMin: 0.30, yMax: 0.65))
+        }
+        for (i, ch) in bottomRow.enumerated() {
+            zones.append(KeyZone(character: ch,
+                                 xMin: cols[i].xMin, xMax: cols[i].xMax,
+                                 yMin: 0.08, yMax: 0.30))
+        }
+        // Space bar: x ∈ [0.02, 0.98), y ∈ [0.00, 0.08)
+        zones.append(KeyZone(character: " ",
+                             xMin: 0.02, xMax: 0.98,
+                             yMin: 0.00, yMax: 0.08))
+
+        return KeyGrid(zones: zones)
+    }()
+}
+
+// MARK: - Character Emitter
+
+final class CharacterEmitter {
+    let grid: KeyGrid
+
+    init(grid: KeyGrid = .default) {
+        self.grid = grid
+    }
+
+    /// Returns a character for a "began" touch, or nil if outside a zone or below pressure threshold.
+    /// - pressure < 0.30  → nil
+    /// - pressure 0.30–0.69 → lowercase character
+    /// - pressure ≥ 0.70  → uppercased character
+    func characterForTouch(at x: Float, y: Float, pressure: Float) -> Character? {
+        guard pressure >= 0.30 else { return nil }
+        guard let zone = grid.zone(at: x, y: y) else { return nil }
+        if pressure >= 0.70 {
+            return Character(String(zone.character).uppercased())
+        } else {
+            return zone.character
+        }
+    }
+}
+
 final class TouchDiagnosticSession: ObservableObject {
     @Published var liveFingers: [FingerState] = []
     @Published var eventLog: [TouchLogEntry] = []
     @Published var isActive: Bool = false
+    @Published var outputBuffer: String = ""
 
+    private let emitter = CharacterEmitter()
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
     private var labelCounter = 0
@@ -187,6 +265,7 @@ final class TouchDiagnosticSession: ObservableObject {
         var liveLookup: [String: FingerState] = Dictionary(
             uniqueKeysWithValues: liveFingers.map { ($0.id, $0) }
         )
+        var emittedZoneKeys: Set<String> = []
 
         // Synthesize "ended" for fingers that disappeared from the frame
         for id in Set(liveLookup.keys).subtracting(currentIDs) {
@@ -233,6 +312,18 @@ final class TouchDiagnosticSession: ObservableObject {
                 phase = "moved"
             }
 
+            if phase == "began" {
+                if let zone = emitter.grid.zone(at: Float(x), y: Float(y)) {
+                    let key = "\(zone.xMin)-\(zone.yMin)"
+                    if !emittedZoneKeys.contains(key) {
+                        emittedZoneKeys.insert(key)
+                        if let ch = emitter.characterForTouch(at: Float(x), y: Float(y), pressure: Float(pressure)) {
+                            outputBuffer.append(ch)
+                        }
+                    }
+                }
+            }
+
             if phase != "stationary" {
                 appendLog(TouchLogEntry(
                     timestamp: Date(), fingerLabel: label,
@@ -257,6 +348,7 @@ final class TouchDiagnosticSession: ObservableObject {
     func clearAll() {
         eventLog = []
         liveFingers = []
+        outputBuffer = ""
         fingerLabels = [:]
         fingerLastTime = [:]
         labelCounter = 0
@@ -288,6 +380,8 @@ struct ContentView: View {
                 FingerTablePanel(fingers: session.liveFingers)
                     .frame(width: 340)
             }
+            Divider()
+            OutputBufferPanel(text: session.outputBuffer)
             Divider()
             EventLogPanel(entries: session.eventLog)
         }
@@ -326,6 +420,64 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Output Buffer Panel
+
+struct OutputBufferPanel: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Output")
+                .font(.headline)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+            Divider()
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(text.isEmpty ? "Start typing…" : text)
+                    .font(.system(size: 16, design: .monospaced))
+                    .foregroundColor(text.isEmpty ? .secondary : .primary)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(height: 80)
+        .background(Color(NSColor.textBackgroundColor))
+    }
+}
+
+// MARK: - Key Grid Overlay
+
+struct KeyGridOverlay: View {
+    private let zones = KeyGrid.default.zones
+
+    var body: some View {
+        GeometryReader { geo in
+            // Zone outlines
+            Canvas { ctx, size in
+                for zone in zones {
+                    let rect = CGRect(
+                        x: CGFloat(zone.xMin) * size.width,
+                        y: (1.0 - CGFloat(zone.yMax)) * size.height,
+                        width: CGFloat(zone.xMax - zone.xMin) * size.width,
+                        height: CGFloat(zone.yMax - zone.yMin) * size.height
+                    )
+                    ctx.stroke(Path(rect), with: .color(.secondary.opacity(0.20)), lineWidth: 0.5)
+                }
+            }
+            // Character labels
+            ForEach(Array(zones.enumerated()), id: \.offset) { _, zone in
+                let cx = CGFloat((zone.xMin + zone.xMax) / 2) * geo.size.width
+                let cy = (1.0 - CGFloat((zone.yMin + zone.yMax) / 2)) * geo.size.height
+                Text(zone.character == " " ? "spc" : String(zone.character).uppercased())
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundColor(.secondary.opacity(0.55))
+                    .position(x: cx, y: cy)
+            }
+        }
+    }
+}
+
 // MARK: - Trackpad Surface
 
 struct TrackpadSurface: View {
@@ -343,10 +495,14 @@ struct TrackpadSurface: View {
                         lineWidth: isActive ? 1.5 : 1
                     )
 
-                if fingers.isEmpty {
-                    Text(isActive ? "Place fingers on trackpad" : "Double-tap ctrl to start")
+                KeyGridOverlay()
+
+                if !isActive {
+                    Text("Double-tap ctrl to start")
                         .font(.system(size: 14))
                         .foregroundColor(.secondary)
+                        .padding(8)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
                 }
 
                 ForEach(fingers) { finger in
