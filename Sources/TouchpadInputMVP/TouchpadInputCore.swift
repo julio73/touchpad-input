@@ -248,13 +248,14 @@ struct ModifierZone {
     }
 
     // Bottom-left corner = Shift hold; bottom-right corner = Delete hold.
-    // Both sit in the margin outside the key grid (x < 0.02 or x > 0.98)
-    // so they never conflict with key zones.
+    // 15 % wide × 15 % tall — large enough for a thumb to rest reliably.
+    // Overlaps slightly with the outermost key columns at y ∈ [0.08, 0.15);
+    // isInModifierZone is checked first so those key sub-areas are silenced.
     static let all: [ModifierZone] = [
         ModifierZone(kind: .shift,  label: "⇧",
-                     xMin: 0.00, xMax: 0.05, yMin: 0.00, yMax: 0.12),
+                     xMin: 0.00, xMax: 0.15, yMin: 0.00, yMax: 0.15),
         ModifierZone(kind: .delete, label: "⌫",
-                     xMin: 0.95, xMax: 1.00, yMin: 0.00, yMax: 0.12),
+                     xMin: 0.85, xMax: 1.00, yMin: 0.00, yMax: 0.15),
     ]
 }
 

@@ -90,8 +90,8 @@ struct ModifierZone {
     }
 
     static let all: [ModifierZone] = [
-        ModifierZone(kind: .shift,  label: "⇧", xMin: 0.00, xMax: 0.05, yMin: 0.00, yMax: 0.12),
-        ModifierZone(kind: .delete, label: "⌫", xMin: 0.95, xMax: 1.00, yMin: 0.00, yMax: 0.12),
+        ModifierZone(kind: .shift,  label: "⇧", xMin: 0.00, xMax: 0.15, yMin: 0.00, yMax: 0.15),
+        ModifierZone(kind: .delete, label: "⌫", xMin: 0.85, xMax: 1.00, yMin: 0.00, yMax: 0.15),
     ]
 }
 
