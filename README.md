@@ -59,9 +59,9 @@ As a user, I can place multiple fingers on the MacBook trackpad and produce lett
 ## Current Status
 
 - [x] M1: Touch capture working (MultitouchSupport bridge, live finger dots, event log)
-- [ ] M2: Character emission (touch-to-key mapping, output buffer)
-- [ ] M3: Multi-touch + pressure handling
-- [ ] M4: Stability pass
+- [x] M2: Character emission (QWERTY key grid, output buffer, force-press alt chars, key grid overlay)
+- [x] M3: Multi-touch + pressure handling (modifier-hold zones: shift + delete corners)
+- [x] M4: Stability pass (contact-size filter, zone cooldown, adjustable pressure floor, settings panel)
 
 ## Run
 

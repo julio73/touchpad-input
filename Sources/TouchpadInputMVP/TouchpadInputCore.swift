@@ -155,6 +155,7 @@ struct FingerState: Identifiable {
     let x: CGFloat           // normalized 0…1
     let y: CGFloat           // normalized 0…1
     let pressure: CGFloat    // from zDensity, clamped 0…1
+    let size: CGFloat        // MTContact.size (contact area)
     let phase: String
     let lastEventTime: TimeInterval
     let deltaMsFromPrev: Int?
@@ -269,12 +270,12 @@ final class CharacterEmitter {
     }
 
     /// Returns a character for a "began" touch, or nil if outside a zone or below pressure threshold.
-    /// - pressure < 0.30  → nil
-    /// - pressure 0.30–0.69 → lowercase character
+    /// - pressure < pressureFloor → nil
+    /// - pressure pressureFloor–0.69 → lowercase character
     /// - pressure 0.70–0.84 → uppercase character
     /// - pressure ≥ 0.85  → altCharacter (or uppercase if no alt defined)
-    func characterForTouch(at x: Float, y: Float, pressure: Float) -> Character? {
-        guard pressure >= 0.30 else { return nil }
+    func characterForTouch(at x: Float, y: Float, pressure: Float, pressureFloor: Float = 0.30) -> Character? {
+        guard pressure >= pressureFloor else { return nil }
         guard let zone = grid.zone(at: x, y: y) else { return nil }
         if pressure >= 0.85 {
             return zone.altCharacter ?? Character(String(zone.character).uppercased())
@@ -293,10 +294,19 @@ final class TouchDiagnosticSession: ObservableObject {
     @Published var outputBuffer: String = ""
     @Published var activeModifiers: Set<ModifierKind> = []
 
+    // MARK: Stability settings
+    /// Minimum zDensity for a touch to emit a character.
+    @Published var pressureFloor: Float = 0.30
+    /// Minimum MTContact.size for a touch to emit a character (0 = disabled).
+    @Published var minContactSize: Float = 0.0
+    /// Minimum milliseconds between two emissions from the same zone.
+    @Published var zoneCooldownMs: Double = 80.0
+
     private let emitter = CharacterEmitter()
     private let modifierZones = ModifierZone.all
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
+    private var lastZoneEmitTime: [String: Double] = [:]
     private var labelCounter = 0
     private let maxLogEntries = 500
 
@@ -375,14 +385,25 @@ final class TouchDiagnosticSession: ObservableObject {
                         let key = "\(zone.xMin)-\(zone.yMin)"
                         if !emittedZoneKeys.contains(key) {
                             emittedZoneKeys.insert(key)
-                            // Shift-hold bumps pressure into uppercase range if below it
-                            var effectivePressure = Float(pressure)
-                            if heldModifiers.contains(.shift),
-                               effectivePressure >= 0.30, effectivePressure < 0.70 {
-                                effectivePressure = 0.70
-                            }
-                            if let ch = emitter.characterForTouch(at: fx, y: fy, pressure: effectivePressure) {
-                                outputBuffer.append(ch)
+                            // Size filter: reject contacts below minimum contact area
+                            let passesSize = contact.size >= minContactSize
+                            // Zone cooldown: reject rapid re-taps of the same zone
+                            let timeSinceMs = (timestamp - (lastZoneEmitTime[key] ?? -999)) * 1000
+                            let passesCooldown = timeSinceMs >= zoneCooldownMs
+                            if passesSize && passesCooldown {
+                                // Shift-hold bumps pressure into uppercase range if below it
+                                var effectivePressure = Float(pressure)
+                                if heldModifiers.contains(.shift),
+                                   effectivePressure >= pressureFloor, effectivePressure < 0.70 {
+                                    effectivePressure = 0.70
+                                }
+                                if let ch = emitter.characterForTouch(
+                                    at: fx, y: fy, pressure: effectivePressure,
+                                    pressureFloor: pressureFloor
+                                ) {
+                                    outputBuffer.append(ch)
+                                    lastZoneEmitTime[key] = timestamp
+                                }
                             }
                         }
                     }
@@ -402,6 +423,7 @@ final class TouchDiagnosticSession: ObservableObject {
             liveLookup[rawID] = FingerState(
                 id: rawID, label: label,
                 x: x, y: y, pressure: pressure,
+                size: CGFloat(contact.size),
                 phase: phase, lastEventTime: timestamp,
                 deltaMsFromPrev: deltaMs
             )
@@ -418,6 +440,7 @@ final class TouchDiagnosticSession: ObservableObject {
         activeModifiers = []
         fingerLabels = [:]
         fingerLastTime = [:]
+        lastZoneEmitTime = [:]
         labelCounter = 0
     }
 
@@ -433,12 +456,58 @@ final class TouchDiagnosticSession: ObservableObject {
 
 #if canImport(SwiftUI)
 
+// MARK: - Settings Panel
+
+struct SettingsPanel: View {
+    @ObservedObject var session: TouchDiagnosticSession
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Stability Settings")
+                .font(.headline)
+            settingRow(label: "Pressure floor",
+                       value: String(format: "%.2f", session.pressureFloor)) {
+                Slider(value: $session.pressureFloor, in: 0.05...0.50, step: 0.05)
+            }
+            settingRow(label: "Min contact size",
+                       value: String(format: "%.2f", session.minContactSize)) {
+                Slider(value: $session.minContactSize, in: 0.0...1.0, step: 0.05)
+            }
+            settingRow(label: "Zone cooldown",
+                       value: "\(Int(session.zoneCooldownMs))ms") {
+                Slider(value: $session.zoneCooldownMs, in: 0...300, step: 20)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color(NSColor.controlBackgroundColor))
+    }
+
+    @ViewBuilder
+    private func settingRow<S: View>(label: String, value: String, @ViewBuilder slider: () -> S) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .frame(width: 140, alignment: .leading)
+                .font(.system(size: 12))
+            slider()
+            Text(value)
+                .frame(width: 44, alignment: .trailing)
+                .font(.system(size: 12, design: .monospaced))
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var session = TouchDiagnosticSession()
+    @State private var showSettings = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            if showSettings {
+                Divider()
+                SettingsPanel(session: session)
+            }
             Divider()
             HStack(spacing: 0) {
                 TrackpadSurface(fingers: session.liveFingers, isActive: session.isActive,
@@ -463,6 +532,12 @@ struct ContentView: View {
                 .font(.system(size: 18, weight: .semibold))
             modePill
             Spacer()
+            Button(action: { showSettings.toggle() }) {
+                Image(systemName: "slider.horizontal.3")
+                    .foregroundColor(showSettings ? .accentColor : .secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Toggle stability settings")
             Button("Clear") { session.clearAll() }
         }
         .padding(.horizontal, 16)
