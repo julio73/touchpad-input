@@ -173,6 +173,55 @@ struct TouchLogEntry: Identifiable {
     let rawState: Int32      // raw MTContact.state — useful during Phase 1 exploration
 }
 
+// MARK: - User Calibration
+
+/// Stores per-zone centroid offsets learned from how the user actually taps.
+/// Persisted to UserDefaults as JSON. Refined incrementally after every emission.
+struct UserCalibration: Codable {
+    struct Offset: Codable {
+        var dx: Float
+        var dy: Float
+        var sampleCount: Int
+    }
+
+    var offsets: [String: Offset]  // key = String(zone.character)
+
+    static let empty = UserCalibration(offsets: [:])
+
+    private static let defaultsKey = "userCalibration"
+
+    func save() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+    }
+
+    static func load() -> UserCalibration {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let cal = try? JSONDecoder().decode(UserCalibration.self, from: data)
+        else { return .empty }
+        return cal
+    }
+
+    /// EMA refinement called after every real tap. α ≈ 0.05 so ~20 taps meaningfully shift a zone.
+    mutating func refine(character: Character, tapX: Float, tapY: Float, in grid: KeyGrid) {
+        guard let zone = grid.zones.first(where: { $0.character == character }) else { return }
+        let cx = (zone.xMin + zone.xMax) / 2
+        let cy = (zone.yMin + zone.yMax) / 2
+        let key = String(zone.character)
+        let newDx = tapX - cx
+        let newDy = tapY - cy
+        let alpha: Float = 0.05
+        if var existing = offsets[key] {
+            existing.dx = (1 - alpha) * existing.dx + alpha * newDx
+            existing.dy = (1 - alpha) * existing.dy + alpha * newDy
+            existing.sampleCount += 1
+            offsets[key] = existing
+        } else {
+            offsets[key] = Offset(dx: newDx, dy: newDy, sampleCount: 1)
+        }
+    }
+}
+
 // MARK: - Key Grid
 
 struct KeyZone {
@@ -187,6 +236,19 @@ struct KeyGrid {
 
     func zone(at x: Float, y: Float) -> KeyZone? {
         zones.first { z in x >= z.xMin && x < z.xMax && y >= z.yMin && y < z.yMax }
+    }
+
+    /// Returns a new grid with each zone's boundaries shifted by its calibration offset.
+    func applying(calibration: UserCalibration) -> KeyGrid {
+        guard !calibration.offsets.isEmpty else { return self }
+        let shifted = zones.map { zone -> KeyZone in
+            let key = String(zone.character)
+            guard let off = calibration.offsets[key] else { return zone }
+            return KeyZone(character: zone.character, altCharacter: zone.altCharacter,
+                           xMin: zone.xMin + off.dx, xMax: zone.xMax + off.dx,
+                           yMin: zone.yMin + off.dy, yMax: zone.yMax + off.dy)
+        }
+        return KeyGrid(zones: shifted)
     }
 
     static let `default`: KeyGrid = {
@@ -260,6 +322,61 @@ struct ModifierZone {
     ]
 }
 
+// MARK: - Calibration Session
+
+/// Drives the first-run calibration flow. Presents one target character at a time;
+/// records where the user actually taps; builds UserCalibration offsets when complete.
+final class CalibrationSession: ObservableObject {
+    // 32 unique characters (all 26 letters, some repeated) covering the full grid.
+    static let sentence = "pack my box with five dozen liquor jugs"
+    static let calibrationTargets: [Character] =
+        Array(sentence.filter { !$0.isWhitespace })
+
+    @Published var currentIndex: Int = 0
+    @Published var isComplete: Bool = false
+
+    private(set) var samples: [(target: Character, x: Float, y: Float)] = []
+
+    var targets: [Character] { Self.calibrationTargets }
+    var progress: Double { Double(currentIndex) / Double(targets.count) }
+    var currentTarget: Character? {
+        currentIndex < targets.count ? targets[currentIndex] : nil
+    }
+
+    func recordTap(x: Float, y: Float) {
+        guard currentIndex < targets.count else { return }
+        samples.append((targets[currentIndex], x, y))
+        currentIndex += 1
+        if currentIndex >= targets.count { isComplete = true }
+    }
+
+    func reset() {
+        currentIndex = 0
+        isComplete = false
+        samples = []
+    }
+
+    /// Computes per-zone centroid offsets from recorded samples.
+    func buildCalibration() -> UserCalibration {
+        let grid = KeyGrid.default
+        var accumulator: [String: [(Float, Float)]] = [:]
+        for sample in samples {
+            guard let zone = grid.zones.first(where: { $0.character == sample.target }) else { continue }
+            let cx = (zone.xMin + zone.xMax) / 2
+            let cy = (zone.yMin + zone.yMax) / 2
+            let key = String(zone.character)
+            accumulator[key, default: []].append((sample.x - cx, sample.y - cy))
+        }
+        var offsets: [String: UserCalibration.Offset] = [:]
+        for (key, diffs) in accumulator {
+            let meanDx = diffs.map { $0.0 }.reduce(0, +) / Float(diffs.count)
+            let meanDy = diffs.map { $0.1 }.reduce(0, +) / Float(diffs.count)
+            offsets[key] = UserCalibration.Offset(dx: meanDx, dy: meanDy, sampleCount: diffs.count)
+        }
+        return UserCalibration(offsets: offsets)
+    }
+}
+
 // MARK: - Character Emitter
 
 final class CharacterEmitter {
@@ -302,13 +419,38 @@ final class TouchDiagnosticSession: ObservableObject {
     /// Minimum milliseconds between two emissions from the same zone.
     @Published var zoneCooldownMs: Double = 80.0
 
-    private let emitter = CharacterEmitter()
+    // MARK: Calibration
+    @Published var userCalibration: UserCalibration = .empty
+
+    // Set by CalibrationModal to intercept touches during the calibration flow.
+    weak var activeCalibrationSession: CalibrationSession?
+
+    private var emitter: CharacterEmitter
     private let modifierZones = ModifierZone.all
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
     private var lastZoneEmitTime: [String: Double] = [:]
     private var labelCounter = 0
     private let maxLogEntries = 500
+
+    init() {
+        let cal = UserCalibration.load()
+        userCalibration = cal
+        emitter = CharacterEmitter(grid: KeyGrid.default.applying(calibration: cal))
+    }
+
+    /// Apply a new calibration (from the calibration flow or a reset).
+    func applyCalibration(_ calibration: UserCalibration) {
+        userCalibration = calibration
+        emitter = CharacterEmitter(grid: KeyGrid.default.applying(calibration: calibration))
+        calibration.save()
+    }
+
+    func resetCalibration() {
+        userCalibration = .empty
+        emitter = CharacterEmitter(grid: .default)
+        UserDefaults.standard.removeObject(forKey: "userCalibration")
+    }
 
     func update(mtContacts contacts: [MTContact], timestamp: Double) {
         // Detect modifiers held from the *previous* frame before any new contacts are processed.
@@ -323,6 +465,7 @@ final class TouchDiagnosticSession: ObservableObject {
         var liveLookup: [String: FingerState] = Dictionary(
             uniqueKeysWithValues: liveFingers.map { ($0.id, $0) }
         )
+
         var emittedZoneKeys: Set<String> = []
 
         // Synthesize "ended" for fingers that disappeared from the frame
@@ -372,40 +515,59 @@ final class TouchDiagnosticSession: ObservableObject {
 
             if phase == "began" {
                 let fx = Float(x), fy = Float(y)
-                // Suppress "began" only for modifier zones that are NOT already held.
-                // Once a modifier is held, any new "began" — even inside that zone — fires the action.
-                let isInUnheldModifierZone = modifierZones.contains { mz in
-                    !heldModifiers.contains(mz.kind) && mz.contains(x: fx, y: fy)
-                }
-                if !isInUnheldModifierZone {
-                    if heldModifiers.contains(.delete) {
-                        // Delete-hold: any tap outside modifier zones removes last char
-                        if !outputBuffer.isEmpty { outputBuffer.removeLast() }
-                    } else if let zone = emitter.grid.zone(at: fx, y: fy) {
-                        let key = "\(zone.xMin)-\(zone.yMin)"
-                        if !emittedZoneKeys.contains(key) {
-                            emittedZoneKeys.insert(key)
-                            // Size filter: reject contacts below minimum contact area
-                            let passesSize = contact.size >= minContactSize
-                            // Zone cooldown: reject rapid re-taps of the same zone
-                            let timeSinceMs = (timestamp - (lastZoneEmitTime[key] ?? -999)) * 1000
-                            let passesCooldown = timeSinceMs >= zoneCooldownMs
-                            if passesSize && passesCooldown {
-                                // Shift-hold bumps pressure into uppercase range if below it
-                                var effectivePressure = Float(pressure)
-                                if heldModifiers.contains(.shift),
-                                   effectivePressure >= pressureFloor, effectivePressure < 0.70 {
-                                    effectivePressure = 0.70
-                                }
-                                if let ch = emitter.characterForTouch(
-                                    at: fx, y: fy, pressure: effectivePressure,
-                                    pressureFloor: pressureFloor
-                                ) {
-                                    outputBuffer.append(ch)
-                                    lastZoneEmitTime[key] = timestamp
-                                    // Haptic feedback — silent click feel
-                                    NSHapticFeedbackManager.defaultPerformer
-                                        .perform(.generic, performanceTime: .default)
+
+                if let calSession = activeCalibrationSession {
+                    // Calibration mode: record this tap for the current target key.
+                    calSession.recordTap(x: fx, y: fy)
+                } else {
+                    // Suppress "began" only for modifier zones that are NOT already held.
+                    // Once a modifier is held, any new "began" — even inside that zone — fires the action.
+                    let isInUnheldModifierZone = modifierZones.contains { mz in
+                        !heldModifiers.contains(mz.kind) && mz.contains(x: fx, y: fy)
+                    }
+                    if !isInUnheldModifierZone {
+                        if heldModifiers.contains(.delete) {
+                            // Delete-hold: any tap outside modifier zones removes last char
+                            if !outputBuffer.isEmpty { outputBuffer.removeLast() }
+                        } else if let zone = emitter.grid.zone(at: fx, y: fy) {
+                            let key = "\(zone.xMin)-\(zone.yMin)"
+                            if !emittedZoneKeys.contains(key) {
+                                emittedZoneKeys.insert(key)
+                                // Size filter: reject contacts below minimum contact area
+                                let passesSize = contact.size >= minContactSize
+                                // Zone cooldown: reject rapid re-taps of the same zone
+                                let timeSinceMs = (timestamp - (lastZoneEmitTime[key] ?? -999)) * 1000
+                                let passesCooldown = timeSinceMs >= zoneCooldownMs
+                                if passesSize && passesCooldown {
+                                    // Shift-hold bumps pressure into uppercase range if below it
+                                    var effectivePressure = Float(pressure)
+                                    if heldModifiers.contains(.shift),
+                                       effectivePressure >= pressureFloor, effectivePressure < 0.70 {
+                                        effectivePressure = 0.70
+                                    }
+                                    if let ch = emitter.characterForTouch(
+                                        at: fx, y: fy, pressure: effectivePressure,
+                                        pressureFloor: pressureFloor
+                                    ) {
+                                        outputBuffer.append(ch)
+                                        lastZoneEmitTime[key] = timestamp
+
+                                        // Haptic feedback — silent click feel
+                                        NSHapticFeedbackManager.defaultPerformer
+                                            .perform(.generic, performanceTime: .default)
+
+                                        // Incremental calibration refinement via EMA
+                                        userCalibration.refine(
+                                            character: zone.character,
+                                            tapX: fx, tapY: fy,
+                                            in: KeyGrid.default
+                                        )
+                                        userCalibration.save()
+                                        emitter = CharacterEmitter(
+                                            grid: KeyGrid.default.applying(calibration: userCalibration)
+                                        )
+
+                                    }
                                 }
                             }
                         }
@@ -445,6 +607,7 @@ final class TouchDiagnosticSession: ObservableObject {
         fingerLastTime = [:]
         lastZoneEmitTime = [:]
         labelCounter = 0
+        activeCalibrationSession = nil
     }
 
     private func appendLog(_ entry: TouchLogEntry) {
@@ -463,6 +626,7 @@ final class TouchDiagnosticSession: ObservableObject {
 
 struct SettingsPanel: View {
     @ObservedObject var session: TouchDiagnosticSession
+    var onRecalibrate: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -480,6 +644,14 @@ struct SettingsPanel: View {
                        value: "\(Int(session.zoneCooldownMs))ms") {
                 Slider(value: $session.zoneCooldownMs, in: 0...300, step: 20)
             }
+            HStack(spacing: 8) {
+                Button("Recalibrate layout…") { onRecalibrate() }
+                    .buttonStyle(.bordered)
+                Button("Reset to default grid") { session.resetCalibration() }
+                    .buttonStyle(.bordered)
+                    .foregroundColor(.red)
+            }
+            .padding(.top, 4)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -500,16 +672,100 @@ struct SettingsPanel: View {
     }
 }
 
+// MARK: - Calibration Modal
+
+struct CalibrationModal: View {
+    @ObservedObject var session: CalibrationSession
+    let diagnosticSession: TouchDiagnosticSession
+    let onComplete: (UserCalibration) -> Void
+    let onSkip: () -> Void
+
+    @State private var isStarted = false
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Text("Welcome to Touchpad Input")
+                .font(.title2).fontWeight(.semibold)
+
+            Text("Type this sentence at your natural pace.\nWe'll learn where your keys are.")
+                .multilineTextAlignment(.center)
+                .foregroundColor(.secondary)
+
+            Text("\"\(CalibrationSession.sentence)\"")
+                .font(.system(size: 15, design: .monospaced))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+
+            if !isStarted {
+                // Pre-start: show Start button so the user opts in deliberately
+                Button("Start Calibration") {
+                    isStarted = true
+                    diagnosticSession.activeCalibrationSession = session
+                    MultitouchCapture.shared.start(session: diagnosticSession)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            } else {
+                // Active calibration: next key highlight
+                if let target = session.currentTarget {
+                    HStack(spacing: 12) {
+                        Text("Next key:")
+                            .foregroundColor(.secondary)
+                        Text(String(target).uppercased())
+                            .font(.system(size: 32, weight: .bold, design: .monospaced))
+                            .frame(width: 56, height: 56)
+                            .background(Color.accentColor.opacity(0.15),
+                                        in: RoundedRectangle(cornerRadius: 10))
+                    }
+                } else {
+                    Text("All done!")
+                        .font(.title3)
+                        .foregroundColor(.green)
+                }
+
+                // Progress
+                VStack(spacing: 6) {
+                    ProgressView(value: session.progress)
+                        .progressViewStyle(.linear)
+                        .frame(width: 300)
+                    Text("\(session.currentIndex) / \(session.targets.count)")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            Button("Skip") { onSkip() }
+                .buttonStyle(.bordered)
+        }
+        .padding(40)
+        .frame(width: 440)
+        .onDisappear {
+            diagnosticSession.activeCalibrationSession = nil
+        }
+        .onChange(of: session.isComplete) { complete in
+            if complete { onComplete(session.buildCalibration()) }
+        }
+    }
+}
+
+// MARK: - Content View
+
 struct ContentView: View {
     @StateObject private var session = TouchDiagnosticSession()
+    @StateObject private var calibSession = CalibrationSession()
     @State private var showSettings = false
+    @State private var showCalibration = false
+    @AppStorage("hasCompletedCalibration") private var hasCompletedCalibration = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
             if showSettings {
                 Divider()
-                SettingsPanel(session: session)
+                SettingsPanel(session: session, onRecalibrate: {
+                    calibSession.reset()
+                    showCalibration = true
+                })
             }
             Divider()
             HStack(spacing: 0) {
@@ -525,8 +781,26 @@ struct ContentView: View {
             Divider()
             EventLogPanel(entries: session.eventLog)
         }
-        .onAppear  { MultitouchCapture.shared.setupDoubleControlToggle(for: session) }
+        .onAppear {
+            MultitouchCapture.shared.setupDoubleControlToggle(for: session)
+            if !hasCompletedCalibration { showCalibration = true }
+        }
         .onDisappear { MultitouchCapture.shared.teardownDoubleControlToggle() }
+        .sheet(isPresented: $showCalibration) {
+            CalibrationModal(
+                session: calibSession,
+                diagnosticSession: session,
+                onComplete: { cal in
+                    session.applyCalibration(cal)
+                    hasCompletedCalibration = true
+                    showCalibration = false
+                },
+                onSkip: {
+                    hasCompletedCalibration = true
+                    showCalibration = false
+                }
+            )
+        }
     }
 
     private var header: some View {
