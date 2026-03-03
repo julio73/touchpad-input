@@ -176,6 +176,7 @@ struct TouchLogEntry: Identifiable {
 
 struct KeyZone {
     let character: Character
+    let altCharacter: Character?   // force-press (zDensity ≥ 0.85); nil = fall back to uppercase
     let xMin, xMax: Float
     let yMin, yMax: Float
 }
@@ -198,30 +199,63 @@ struct KeyGrid {
         let homeRow:   [Character] = ["a","s","d","f","g","h","j","k","l",";"]
         let bottomRow: [Character] = ["z","x","c","v","b","n","m",",",".","/"]
 
+        // Force-press alternates: number row, shifted symbols, programmer punctuation
+        let topAlt:    [Character] = ["1","2","3","4","5","6","7","8","9","0"]
+        let homeAlt:   [Character] = ["!","@","#","$","%","^","&","*","(",")"]
+        let bottomAlt: [Character] = ["-","_","+","=","[","]","{","}","`","~"]
+
         var zones: [KeyZone] = []
 
-        for (i, ch) in topRow.enumerated() {
-            zones.append(KeyZone(character: ch,
+        for (i, (ch, alt)) in zip(topRow, topAlt).enumerated() {
+            zones.append(KeyZone(character: ch, altCharacter: alt,
                                  xMin: cols[i].xMin, xMax: cols[i].xMax,
                                  yMin: 0.65, yMax: 1.0))
         }
-        for (i, ch) in homeRow.enumerated() {
-            zones.append(KeyZone(character: ch,
+        for (i, (ch, alt)) in zip(homeRow, homeAlt).enumerated() {
+            zones.append(KeyZone(character: ch, altCharacter: alt,
                                  xMin: cols[i].xMin, xMax: cols[i].xMax,
                                  yMin: 0.30, yMax: 0.65))
         }
-        for (i, ch) in bottomRow.enumerated() {
-            zones.append(KeyZone(character: ch,
+        for (i, (ch, alt)) in zip(bottomRow, bottomAlt).enumerated() {
+            zones.append(KeyZone(character: ch, altCharacter: alt,
                                  xMin: cols[i].xMin, xMax: cols[i].xMax,
                                  yMin: 0.08, yMax: 0.30))
         }
-        // Space bar: x ∈ [0.02, 0.98), y ∈ [0.00, 0.08)
-        zones.append(KeyZone(character: " ",
+        // Space bar → newline on force-press
+        zones.append(KeyZone(character: " ", altCharacter: "\n",
                              xMin: 0.02, xMax: 0.98,
                              yMin: 0.00, yMax: 0.08))
 
         return KeyGrid(zones: zones)
     }()
+}
+
+// MARK: - Modifier Zones
+
+enum ModifierKind: Hashable {
+    case shift   // thumb held here → force uppercase on next tap(s)
+    case delete  // thumb held here → next tap removes last output char
+}
+
+struct ModifierZone {
+    let kind: ModifierKind
+    let label: String
+    let xMin, xMax: Float
+    let yMin, yMax: Float
+
+    func contains(x: Float, y: Float) -> Bool {
+        x >= xMin && x < xMax && y >= yMin && y < yMax
+    }
+
+    // Bottom-left corner = Shift hold; bottom-right corner = Delete hold.
+    // Both sit in the margin outside the key grid (x < 0.02 or x > 0.98)
+    // so they never conflict with key zones.
+    static let all: [ModifierZone] = [
+        ModifierZone(kind: .shift,  label: "⇧",
+                     xMin: 0.00, xMax: 0.05, yMin: 0.00, yMax: 0.12),
+        ModifierZone(kind: .delete, label: "⌫",
+                     xMin: 0.95, xMax: 1.00, yMin: 0.00, yMax: 0.12),
+    ]
 }
 
 // MARK: - Character Emitter
@@ -236,11 +270,14 @@ final class CharacterEmitter {
     /// Returns a character for a "began" touch, or nil if outside a zone or below pressure threshold.
     /// - pressure < 0.30  → nil
     /// - pressure 0.30–0.69 → lowercase character
-    /// - pressure ≥ 0.70  → uppercased character
+    /// - pressure 0.70–0.84 → uppercase character
+    /// - pressure ≥ 0.85  → altCharacter (or uppercase if no alt defined)
     func characterForTouch(at x: Float, y: Float, pressure: Float) -> Character? {
         guard pressure >= 0.30 else { return nil }
         guard let zone = grid.zone(at: x, y: y) else { return nil }
-        if pressure >= 0.70 {
+        if pressure >= 0.85 {
+            return zone.altCharacter ?? Character(String(zone.character).uppercased())
+        } else if pressure >= 0.70 {
             return Character(String(zone.character).uppercased())
         } else {
             return zone.character
@@ -253,14 +290,24 @@ final class TouchDiagnosticSession: ObservableObject {
     @Published var eventLog: [TouchLogEntry] = []
     @Published var isActive: Bool = false
     @Published var outputBuffer: String = ""
+    @Published var activeModifiers: Set<ModifierKind> = []
 
     private let emitter = CharacterEmitter()
+    private let modifierZones = ModifierZone.all
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
     private var labelCounter = 0
     private let maxLogEntries = 500
 
     func update(mtContacts contacts: [MTContact], timestamp: Double) {
+        // Detect modifiers held from the *previous* frame before any new contacts are processed.
+        let heldModifiers: Set<ModifierKind> = Set(
+            modifierZones.compactMap { mz in
+                liveFingers.contains { mz.contains(x: Float($0.x), y: Float($0.y)) }
+                    ? mz.kind : nil
+            }
+        )
+
         let currentIDs = Set(contacts.map { String($0.identifier) })
         var liveLookup: [String: FingerState] = Dictionary(
             uniqueKeysWithValues: liveFingers.map { ($0.id, $0) }
@@ -313,12 +360,25 @@ final class TouchDiagnosticSession: ObservableObject {
             }
 
             if phase == "began" {
-                if let zone = emitter.grid.zone(at: Float(x), y: Float(y)) {
-                    let key = "\(zone.xMin)-\(zone.yMin)"
-                    if !emittedZoneKeys.contains(key) {
-                        emittedZoneKeys.insert(key)
-                        if let ch = emitter.characterForTouch(at: Float(x), y: Float(y), pressure: Float(pressure)) {
-                            outputBuffer.append(ch)
+                let fx = Float(x), fy = Float(y)
+                let isInModifierZone = modifierZones.contains { $0.contains(x: fx, y: fy) }
+                if !isInModifierZone {
+                    if heldModifiers.contains(.delete) {
+                        // Delete-hold: any tap outside modifier zones removes last char
+                        if !outputBuffer.isEmpty { outputBuffer.removeLast() }
+                    } else if let zone = emitter.grid.zone(at: fx, y: fy) {
+                        let key = "\(zone.xMin)-\(zone.yMin)"
+                        if !emittedZoneKeys.contains(key) {
+                            emittedZoneKeys.insert(key)
+                            // Shift-hold bumps pressure into uppercase range if below it
+                            var effectivePressure = Float(pressure)
+                            if heldModifiers.contains(.shift),
+                               effectivePressure >= 0.30, effectivePressure < 0.70 {
+                                effectivePressure = 0.70
+                            }
+                            if let ch = emitter.characterForTouch(at: fx, y: fy, pressure: effectivePressure) {
+                                outputBuffer.append(ch)
+                            }
                         }
                     }
                 }
@@ -343,12 +403,14 @@ final class TouchDiagnosticSession: ObservableObject {
         }
 
         liveFingers = Array(liveLookup.values).sorted { $0.label < $1.label }
+        activeModifiers = heldModifiers
     }
 
     func clearAll() {
         eventLog = []
         liveFingers = []
         outputBuffer = ""
+        activeModifiers = []
         fingerLabels = [:]
         fingerLastTime = [:]
         labelCounter = 0
@@ -374,14 +436,15 @@ struct ContentView: View {
             header
             Divider()
             HStack(spacing: 0) {
-                TrackpadSurface(fingers: session.liveFingers, isActive: session.isActive)
+                TrackpadSurface(fingers: session.liveFingers, isActive: session.isActive,
+                                activeModifiers: session.activeModifiers)
                     .padding(16)
                 Divider()
                 FingerTablePanel(fingers: session.liveFingers)
                     .frame(width: 340)
             }
             Divider()
-            OutputBufferPanel(text: session.outputBuffer)
+            OutputBufferPanel(text: session.outputBuffer, activeModifiers: session.activeModifiers)
             Divider()
             EventLogPanel(entries: session.eventLog)
         }
@@ -424,13 +487,30 @@ struct ContentView: View {
 
 struct OutputBufferPanel: View {
     let text: String
+    var activeModifiers: Set<ModifierKind> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Output")
-                .font(.headline)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
+            HStack(spacing: 8) {
+                Text("Output")
+                    .font(.headline)
+                if activeModifiers.contains(.shift) {
+                    Text("⇧ SHIFT")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.blue, in: RoundedRectangle(cornerRadius: 4))
+                }
+                if activeModifiers.contains(.delete) {
+                    Text("⌫ DEL")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.orange, in: RoundedRectangle(cornerRadius: 4))
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
             Divider()
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(text.isEmpty ? "Start typing…" : text)
@@ -449,11 +529,14 @@ struct OutputBufferPanel: View {
 // MARK: - Key Grid Overlay
 
 struct KeyGridOverlay: View {
+    var activeModifiers: Set<ModifierKind> = []
+
     private let zones = KeyGrid.default.zones
+    private let modZones = ModifierZone.all
 
     var body: some View {
         GeometryReader { geo in
-            // Zone outlines
+            // Key zone outlines + modifier zone fills
             Canvas { ctx, size in
                 for zone in zones {
                     let rect = CGRect(
@@ -464,14 +547,40 @@ struct KeyGridOverlay: View {
                     )
                     ctx.stroke(Path(rect), with: .color(.secondary.opacity(0.20)), lineWidth: 0.5)
                 }
+                for mz in modZones {
+                    let rect = CGRect(
+                        x: CGFloat(mz.xMin) * size.width,
+                        y: (1.0 - CGFloat(mz.yMax)) * size.height,
+                        width: CGFloat(mz.xMax - mz.xMin) * size.width,
+                        height: CGFloat(mz.yMax - mz.yMin) * size.height
+                    )
+                    let isActive = activeModifiers.contains(mz.kind)
+                    let fillColor: GraphicsContext.Shading = isActive
+                        ? (mz.kind == .shift ? .color(.blue.opacity(0.30)) : .color(.orange.opacity(0.30)))
+                        : (mz.kind == .shift ? .color(.blue.opacity(0.08))  : .color(.orange.opacity(0.08)))
+                    ctx.fill(Path(rect), with: fillColor)
+                    ctx.stroke(Path(rect), with: .color(.secondary.opacity(0.25)), lineWidth: 0.5)
+                }
             }
-            // Character labels
+            // Key labels
             ForEach(Array(zones.enumerated()), id: \.offset) { _, zone in
                 let cx = CGFloat((zone.xMin + zone.xMax) / 2) * geo.size.width
                 let cy = (1.0 - CGFloat((zone.yMin + zone.yMax) / 2)) * geo.size.height
                 Text(zone.character == " " ? "spc" : String(zone.character).uppercased())
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundColor(.secondary.opacity(0.55))
+                    .position(x: cx, y: cy)
+            }
+            // Modifier zone labels
+            ForEach(Array(modZones.enumerated()), id: \.offset) { _, mz in
+                let cx = CGFloat((mz.xMin + mz.xMax) / 2) * geo.size.width
+                let cy = (1.0 - CGFloat((mz.yMin + mz.yMax) / 2)) * geo.size.height
+                let isActive = activeModifiers.contains(mz.kind)
+                Text(mz.label)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(isActive
+                        ? (mz.kind == .shift ? .blue : .orange)
+                        : .secondary.opacity(0.45))
                     .position(x: cx, y: cy)
             }
         }
@@ -483,6 +592,7 @@ struct KeyGridOverlay: View {
 struct TrackpadSurface: View {
     let fingers: [FingerState]
     let isActive: Bool
+    var activeModifiers: Set<ModifierKind> = []
 
     var body: some View {
         GeometryReader { geo in
@@ -495,7 +605,7 @@ struct TrackpadSurface: View {
                         lineWidth: isActive ? 1.5 : 1
                     )
 
-                KeyGridOverlay()
+                KeyGridOverlay(activeModifiers: activeModifiers)
 
                 if !isActive {
                     Text("Double-tap ctrl to start")
