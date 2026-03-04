@@ -63,6 +63,11 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
     @Published public var minContactSize: Float = 0.0
     @Published public var zoneCooldownMs: Double = 80.0
 
+    // MARK: Gesture settings
+
+    /// Minimum x-velocity (units/frame, negative = leftward) to trigger swipe-delete-word.
+    public var swipeDeleteVelocityThreshold: Float = -1.5
+
     // MARK: Calibration
 
     @Published public var userCalibration: UserCalibration = .empty
@@ -88,6 +93,8 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
     private var fingerLabels: [String: String] = [:]
     private var fingerLastTime: [String: TimeInterval] = [:]
     private var lastZoneEmitTime: [String: Double] = [:]
+    private var lastSwipeDeleteTime: Double = -999
+    private let swipeDeleteCooldownMs: Double = 300
     private var labelCounter = 0
     private let maxLogEntries = 500
 
@@ -155,6 +162,22 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
         completions = []
     }
 
+    /// Removes the current partial word from the output buffer.
+    /// If the partial word is empty (cursor is after a space), removes that trailing separator.
+    public func deleteWord() {
+        let partial = currentPartialWord
+        if partial.isEmpty {
+            if !outputBuffer.isEmpty {
+                outputBuffer.removeLast()
+                externalOutputTarget?.deleteLastCharacter()
+            }
+        } else {
+            outputBuffer.removeLast(partial.count)
+            for _ in partial { externalOutputTarget?.deleteLastCharacter() }
+        }
+        completions = completionProvider?.completions(forPartial: currentPartialWord, maxCount: 3) ?? []
+    }
+
     // MARK: Update (main entry point from MultitouchCapture)
 
     public func update(mtContacts contacts: [MTContact], timestamp: Double) {
@@ -170,15 +193,31 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
             uniqueKeysWithValues: liveFingers.map { ($0.id, $0) }
         )
 
+        // Swipe takes priority over tap: classify before acting on either.
+        let isSwipeLeft = contacts.count == 2
+            && activeCalibrationSession == nil
+            && !heldModifiers.contains(.delete)
+            && contacts.allSatisfy({ $0.normalized.velocity.x < swipeDeleteVelocityThreshold })
+
         // Two-finger tap: accept top autocomplete suggestion.
         let newContactIDs = currentIDs.subtracting(Set(liveLookup.keys))
         let twoFingerTapAccepted: Bool
         if newContactIDs.count >= 2 && liveLookup.isEmpty
-            && !completions.isEmpty && !heldModifiers.contains(.delete) {
+            && !completions.isEmpty && !heldModifiers.contains(.delete) && !isSwipeLeft {
             acceptCompletion(completions[0])
             twoFingerTapAccepted = true
         } else {
             twoFingerTapAccepted = false
+        }
+
+        // Two-finger swipe-left: delete word.
+        if isSwipeLeft {
+            let timeSince = (timestamp - lastSwipeDeleteTime) * 1000
+            if timeSince >= swipeDeleteCooldownMs {
+                deleteWord()
+                NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+                lastSwipeDeleteTime = timestamp
+            }
         }
 
         var emittedZoneKeys: Set<String> = []
@@ -228,7 +267,7 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
                 phase = "moved"
             }
 
-            if phase == "began" && !twoFingerTapAccepted {
+            if phase == "began" && !twoFingerTapAccepted && !isSwipeLeft {
                 let fx = Float(x), fy = Float(y)
 
                 if let calSession = activeCalibrationSession {
@@ -337,6 +376,7 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
         fingerLabels = [:]
         fingerLastTime = [:]
         lastZoneEmitTime = [:]
+        lastSwipeDeleteTime = -999
         labelCounter = 0
         activeCalibrationSession = nil
         externalOutputTarget?.clear()
