@@ -1,9 +1,13 @@
 import SwiftUI
+import AppKit
 import TouchpadInputCore
 
 struct SettingsPanel: View {
     @ObservedObject var session: TouchInputSession
     var onRecalibrate: () -> Void
+
+    @State private var useSystemInjection = false
+    @State private var accessibilityGranted = AXIsProcessTrusted()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -21,6 +25,27 @@ struct SettingsPanel: View {
                        value: "\(Int(session.zoneCooldownMs))ms") {
                 Slider(value: $session.zoneCooldownMs, in: 0...300, step: 20)
             }
+
+            Divider()
+
+            // System injection toggle
+            HStack(spacing: 10) {
+                Toggle("Inject into frontmost app (CGEvent)", isOn: $useSystemInjection)
+                    .font(.system(size: 12))
+                    .onChange(of: useSystemInjection) { enabled in
+                        if enabled {
+                            accessibilityGranted = CGEventOutputTarget.requestAccessibilityPermission()
+                            session.externalOutputTarget = accessibilityGranted ? CGEventOutputTarget() : nil
+                            if !accessibilityGranted { useSystemInjection = false }
+                        } else {
+                            session.externalOutputTarget = nil
+                        }
+                    }
+                if useSystemInjection {
+                    permissionBadge
+                }
+            }
+
             HStack(spacing: 8) {
                 Button("Recalibrate layout…") { onRecalibrate() }
                     .buttonStyle(.bordered)
@@ -33,6 +58,15 @@ struct SettingsPanel: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(Color(NSColor.controlBackgroundColor))
+    }
+
+    private var permissionBadge: some View {
+        Text(accessibilityGranted ? "✓ Accessibility" : "✗ Permission denied")
+            .font(.system(size: 10, weight: .medium))
+            .foregroundColor(.white)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(accessibilityGranted ? Color.green : Color.red,
+                        in: RoundedRectangle(cornerRadius: 4))
     }
 
     @ViewBuilder
