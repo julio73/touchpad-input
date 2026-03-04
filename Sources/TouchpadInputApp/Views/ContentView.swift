@@ -26,8 +26,12 @@ struct ContentView: View {
             }
             Divider()
             HStack(spacing: 0) {
-                TrackpadSurface(fingers: session.liveFingers, isActive: session.isActive,
-                                activeModifiers: session.activeModifiers)
+                TrackpadSurface(
+                    fingers: session.liveFingers,
+                    isActive: session.isActive,
+                    zones: KeyGrid.default.applying(calibration: session.userCalibration).zones,
+                    activeModifiers: session.activeModifiers
+                )
                     .padding(16)
                 Divider()
                 FingerTablePanel(fingers: session.liveFingers)

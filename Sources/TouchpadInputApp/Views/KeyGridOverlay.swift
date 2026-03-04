@@ -2,9 +2,9 @@ import SwiftUI
 import TouchpadInputCore
 
 struct KeyGridOverlay: View {
+    var zones: [KeyZone]
     var activeModifiers: Set<AnyModifierKind> = []
 
-    private let zones = KeyGrid.default.zones
     private let modZones = ModifierZone.all
 
     var body: some View {
