@@ -4,6 +4,7 @@ import TouchpadInputCore
 struct TrackpadSurface: View {
     let fingers: [FingerState]
     let isActive: Bool
+    var zones: [KeyZone] = KeyGrid.default.zones
     var activeModifiers: Set<AnyModifierKind> = []
 
     var body: some View {
@@ -17,7 +18,7 @@ struct TrackpadSurface: View {
                         lineWidth: isActive ? 1.5 : 1
                     )
 
-                KeyGridOverlay(activeModifiers: activeModifiers)
+                KeyGridOverlay(zones: zones, activeModifiers: activeModifiers)
 
                 if !isActive {
                     Text("Double-tap ctrl to start")
