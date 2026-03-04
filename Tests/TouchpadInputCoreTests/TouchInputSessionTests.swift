@@ -12,10 +12,12 @@ func makeContact(
     y: Float = 0.5,
     pressure: Float = 0.5,
     size: Float = 0.0,
-    state: Int32 = 4
+    state: Int32 = 4,
+    vx: Float = 0,
+    vy: Float = 0
 ) -> MTContact {
     let posVec = MTVector(x: x, y: y)
-    let velVec = MTVector(x: 0, y: 0)
+    let velVec = MTVector(x: vx, y: vy)
     let normalized = MTPoint(position: posVec, velocity: velVec)
     let absVec = MTVector(x: 0, y: 0)
     let absoluteVector = MTPoint(position: absVec, velocity: absVec)
@@ -404,6 +406,65 @@ final class StabilityTests: XCTestCase {
 
             XCTAssertEqual(session.outputBuffer, "qq",
                            "Second tap after cooldown expiry should emit")
+        }
+    }
+}
+
+// MARK: - SwipeDeleteTests
+
+@MainActor
+final class SwipeDeleteTests: XCTestCase {
+
+    func testTwoFingerSwipeLeftDeletesCurrentWord() {
+        MainActor.assumeIsolated {
+            let session = TouchInputSession()
+
+            // Type "hello wo" via taps (individual single-finger contacts)
+            for (i, ch) in "hello wo".enumerated() {
+                guard let zone = KeyGrid.default.zones.first(where: { $0.character == ch }) else { continue }
+                let cx = (zone.xMin + zone.xMax) / 2
+                let cy = (zone.yMin + zone.yMax) / 2
+                let c = makeContact(id: Int32(100 + i), x: cx, y: cy, pressure: 0.45)
+                session.update(mtContacts: [c], timestamp: Double(i) * 0.5)
+                session.update(mtContacts: [], timestamp: Double(i) * 0.5 + 0.1)
+            }
+            XCTAssertEqual(session.outputBuffer, "hello wo")
+
+            // Two-finger swipe left: both fingers have velocity well below threshold (-1.5)
+            let swipe1 = makeContact(id: 10, x: 0.4, y: 0.5, pressure: 0.1, vx: -3.0)
+            let swipe2 = makeContact(id: 11, x: 0.6, y: 0.5, pressure: 0.1, vx: -3.0)
+            session.update(mtContacts: [swipe1, swipe2], timestamp: 10.0)
+
+            XCTAssertEqual(session.outputBuffer, "hello ",
+                           "Swipe-left should delete the partial word 'wo', leaving 'hello '")
+        }
+    }
+
+    func testTwoFingerSwipeLeftCooldownPreventsDoubleDelete() {
+        MainActor.assumeIsolated {
+            let session = TouchInputSession()
+
+            // Type "hello world"
+            for (i, ch) in "hello world".enumerated() {
+                guard let zone = KeyGrid.default.zones.first(where: { $0.character == ch }) else { continue }
+                let cx = (zone.xMin + zone.xMax) / 2
+                let cy = (zone.yMin + zone.yMax) / 2
+                let c = makeContact(id: Int32(100 + i), x: cx, y: cy, pressure: 0.45)
+                session.update(mtContacts: [c], timestamp: Double(i) * 0.5)
+                session.update(mtContacts: [], timestamp: Double(i) * 0.5 + 0.1)
+            }
+            XCTAssertEqual(session.outputBuffer, "hello world")
+
+            // First swipe frame
+            let s1 = makeContact(id: 10, x: 0.4, y: 0.5, pressure: 0.1, vx: -3.0)
+            let s2 = makeContact(id: 11, x: 0.6, y: 0.5, pressure: 0.1, vx: -3.0)
+            session.update(mtContacts: [s1, s2], timestamp: 10.0)
+            XCTAssertEqual(session.outputBuffer, "hello ")
+
+            // Second swipe frame 50ms later — within 300ms cooldown, should NOT fire again
+            session.update(mtContacts: [s1, s2], timestamp: 10.050)
+            XCTAssertEqual(session.outputBuffer, "hello ",
+                           "Swipe within cooldown window should not fire a second deleteWord")
         }
     }
 }
