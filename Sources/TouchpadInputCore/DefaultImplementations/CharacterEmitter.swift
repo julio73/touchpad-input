@@ -2,9 +2,8 @@
 
 /// Converts zone IDs and pressure values into characters using the QWERTY pressure model:
 /// - pressure < pressureFloor → nil
-/// - pressureFloor…0.69 → lowercase
-/// - 0.70…0.84 → uppercase
-/// - ≥ 0.85 → altCharacter (or uppercase if none defined)
+/// - pressureFloor…0.94 → lowercase
+/// - ≥ 0.95 → altCharacter (or uppercase if none defined)
 public struct CharacterEmitter: CharacterResolver {
     public let grid: KeyGrid
 
@@ -16,6 +15,9 @@ public struct CharacterEmitter: CharacterResolver {
                           modifiers: Set<AnyModifierKind>, pressureFloor: Float) -> Character? {
         guard pressure >= pressureFloor else { return nil }
         guard let zone = grid.zones.first(where: { String($0.character) == id }) else { return nil }
+        if modifiers.contains(.shift) {
+            return Character(String(zone.character).uppercased())
+        }
         return resolve(zone: zone, pressure: pressure)
     }
 
@@ -31,10 +33,8 @@ public struct CharacterEmitter: CharacterResolver {
     // MARK: Private
 
     private func resolve(zone: KeyZone, pressure: Float) -> Character {
-        if pressure >= 0.85 {
+        if pressure >= 0.95 {
             return zone.altCharacter ?? Character(String(zone.character).uppercased())
-        } else if pressure >= 0.70 {
-            return Character(String(zone.character).uppercased())
         } else {
             return zone.character
         }
