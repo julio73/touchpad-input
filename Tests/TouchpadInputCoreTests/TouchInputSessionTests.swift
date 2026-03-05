@@ -247,9 +247,9 @@ final class CharacterEmitterTests: XCTestCase {
         XCTAssertEqual(ch, "q")
     }
 
-    func testFirmPressureEmitsUppercase() {
+    func testFirmPressureStillEmitsLowercase() {
         let ch = emitter.characterForTouch(at: 0.05, y: 0.80, pressure: 0.75)
-        XCTAssertEqual(ch, "Q")
+        XCTAssertEqual(ch, "q")
     }
 
     func testMissZoneEmitsNil() {
@@ -265,23 +265,23 @@ final class ForcePressTests: XCTestCase {
     let emitter = CharacterEmitter()
 
     func testForcePressEmitsAltChar() {
-        let ch = emitter.characterForTouch(at: 0.05, y: 0.80, pressure: 0.90)
+        let ch = emitter.characterForTouch(at: 0.05, y: 0.80, pressure: 0.95)
         XCTAssertEqual(ch, "1")
     }
 
     func testForcePressSpaceEmitsNewline() {
-        let ch = emitter.characterForTouch(at: 0.50, y: 0.04, pressure: 0.90)
+        let ch = emitter.characterForTouch(at: 0.50, y: 0.04, pressure: 0.95)
         XCTAssertEqual(ch, "\n")
     }
 
     func testForcePressHomeRowAlt() {
-        let ch = emitter.characterForTouch(at: 0.05, y: 0.50, pressure: 0.88)
+        let ch = emitter.characterForTouch(at: 0.05, y: 0.50, pressure: 0.95)
         XCTAssertEqual(ch, "!")
     }
 
-    func testBoundaryJustBelowForcePressIsUppercase() {
+    func testPressureBelowAltThresholdEmitsLowercase() {
         let ch = emitter.characterForTouch(at: 0.05, y: 0.80, pressure: 0.84)
-        XCTAssertEqual(ch, "Q")
+        XCTAssertEqual(ch, "q")
     }
 }
 
