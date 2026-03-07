@@ -6,7 +6,7 @@ The flagship app (TouchpadInput) is built on top of this library.
 ## Requirements
 
 - macOS 12+
-- Swift 5.9+ / Xcode 15+
+- Swift 6.0+ / Xcode 16+
 - Accessibility permission (for `CGEventOutputTarget` system injection)
 
 ## Installation
