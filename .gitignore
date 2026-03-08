@@ -1,4 +1,5 @@
 .build/
+.claude/
 .home/
 xcuserdata/
 .DS_Store
