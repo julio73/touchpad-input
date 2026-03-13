@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        No sandbox: the app uses MultitouchSupport.framework (private, via dlopen)
+        and CGEvent injection, both incompatible with the App Sandbox.
+        Distribution is via notarized Developer ID DMG, not Mac App Store.
+    -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+
+    <!--
+        Hardened runtime exception: allows dlopen of private system frameworks
+        (MultitouchSupport.framework) that are not in the standard load path.
+        Apple-signed, so library validation would normally pass — included as
+        a precaution for edge cases during notarization.
+    -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
