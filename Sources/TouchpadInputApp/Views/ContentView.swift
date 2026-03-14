@@ -37,7 +37,7 @@ struct ContentView: View {
                     TrackpadSurface(
                         fingers: session.liveFingers,
                         isActive: session.isActive,
-                        zones: KeyGrid.default.applying(calibration: session.userCalibration).zones,
+                        zones: KeyGrid.default.zones,
                         activeModifiers: session.activeModifiers
                     )
                         .padding(16)
@@ -45,20 +45,20 @@ struct ContentView: View {
                     FingerTablePanel(fingers: session.liveFingers)
                         .frame(width: 340)
                 }
-            }
-            Divider()
-            HStack(spacing: 0) {
-                TrackpadSurface(
-                    fingers: session.liveFingers,
-                    isActive: session.isActive,
-                    zones: KeyGrid.default.zones,
-                    activeModifiers: session.activeModifiers
-                )
-                    .padding(16)
                 Divider()
-                OutputBufferPanel(text: session.outputBuffer, activeModifiers: session.activeModifiers)
-                Divider()
-                EventLogPanel(entries: session.eventLog)
+                HStack(spacing: 0) {
+                    TrackpadSurface(
+                        fingers: session.liveFingers,
+                        isActive: session.isActive,
+                        zones: KeyGrid.default.zones,
+                        activeModifiers: session.activeModifiers
+                    )
+                        .padding(16)
+                    Divider()
+                    OutputBufferPanel(text: session.outputBuffer, activeModifiers: session.activeModifiers)
+                    Divider()
+                    EventLogPanel(entries: session.eventLog)
+                }
             } else {
                 DrawingCanvasView(session: drawSession)
             }
