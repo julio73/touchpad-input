@@ -29,7 +29,7 @@ struct ContentView: View {
                 TrackpadSurface(
                     fingers: session.liveFingers,
                     isActive: session.isActive,
-                    zones: KeyGrid.default.applying(calibration: session.userCalibration).zones,
+                    zones: KeyGrid.default.zones,
                     activeModifiers: session.activeModifiers
                 )
                     .padding(16)

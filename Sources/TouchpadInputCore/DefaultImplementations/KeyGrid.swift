@@ -28,17 +28,12 @@ public struct KeyGrid: Sendable {
         zones.first { z in x >= z.xMin && x < z.xMax && y >= z.yMin && y < z.yMax }
     }
 
-    /// Returns a new grid with each zone's boundaries shifted by its calibration offset.
-    public func applying(calibration: UserCalibration) -> KeyGrid {
-        guard !calibration.offsets.isEmpty else { return self }
-        let shifted = zones.map { zone -> KeyZone in
-            let key = String(zone.character)
-            guard let off = calibration.offsets[key] else { return zone }
-            return KeyZone(character: zone.character, altCharacter: zone.altCharacter,
-                           xMin: zone.xMin + off.dx, xMax: zone.xMax + off.dx,
-                           yMin: zone.yMin + off.dy, yMax: zone.yMax + off.dy)
-        }
-        return KeyGrid(zones: shifted)
+    /// Looks up a zone after correcting for the user's global hand-position offset.
+    /// Adjusting the tap coordinate (rather than shifting zone boundaries) keeps the grid
+    /// perfectly tiled with no overlaps or gaps.
+    public func zone(at x: Float, y: Float, calibration: UserCalibration) -> KeyZone? {
+        let off = calibration.globalOffset
+        return zone(at: x - off.dx, y: y - off.dy)
     }
 
     public static let `default`: KeyGrid = {
@@ -87,6 +82,11 @@ public struct KeyGrid: Sendable {
 extension KeyGrid: InputZoneProvider {
     public func zoneID(at x: Float, y: Float) -> String? {
         guard let z = zone(at: x, y: y) else { return nil }
+        return String(z.character)
+    }
+
+    public func zoneID(at x: Float, y: Float, calibration: UserCalibration) -> String? {
+        guard let z = zone(at: x, y: y, calibration: calibration) else { return nil }
         return String(z.character)
     }
 

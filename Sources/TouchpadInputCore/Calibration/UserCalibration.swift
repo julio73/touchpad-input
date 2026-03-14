@@ -18,6 +18,16 @@ public struct UserCalibration: Codable, Sendable {
 
     public static let empty = UserCalibration(offsets: [:])
 
+    /// Median per-axis offset across all calibrated keys. Applied to the raw tap coordinate
+    /// before zone lookup so the grid boundaries stay intact (no overlap / gaps).
+    public var globalOffset: (dx: Float, dy: Float) {
+        guard !offsets.isEmpty else { return (0, 0) }
+        let dxs = offsets.values.map { $0.dx }.sorted()
+        let dys = offsets.values.map { $0.dy }.sorted()
+        let mid = offsets.count / 2
+        return (dxs[mid], dys[mid])
+    }
+
     public init(offsets: [String: Offset]) { self.offsets = offsets }
 
     private static let defaultsKey = "userCalibration"
