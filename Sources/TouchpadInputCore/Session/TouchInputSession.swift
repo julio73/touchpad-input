@@ -117,10 +117,9 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
 
     public convenience init() {
         let cal = UserCalibration.load()
-        let calibratedGrid = KeyGrid.default.applying(calibration: cal)
         self.init(
-            zoneProvider: calibratedGrid,
-            resolver: CharacterEmitter(grid: calibratedGrid),
+            zoneProvider: KeyGrid.default,
+            resolver: CharacterEmitter(grid: .default),
             modifierStrategy: CornerModifierStrategy.default,
             completionProvider: SpellCheckerCompletionProvider()
         )
@@ -131,9 +130,8 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
 
     public func applyCalibration(_ calibration: UserCalibration) {
         userCalibration = calibration
-        let calibratedGrid = KeyGrid.default.applying(calibration: calibration)
-        zoneProvider = calibratedGrid
-        resolver = CharacterEmitter(grid: calibratedGrid)
+        zoneProvider = KeyGrid.default
+        resolver = CharacterEmitter(grid: .default)
         calibration.save()
     }
 
@@ -274,8 +272,13 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
                 if let calSession = activeCalibrationSession {
                     calSession.recordTap(x: fx, y: fy)
                 } else {
+                    // Adjust tap by global calibration offset before zone lookup.
+                    let calOff = userCalibration.globalOffset
+                    let calX = fx - calOff.dx
+                    let calY = fy - calOff.dy
+
                     // Suppress "began" only for modifier zones that are NOT already held.
-                    let modifier = modifierStrategy.modifierKind(at: fx, y: fy)
+                    let modifier = modifierStrategy.modifierKind(at: calX, y: calY)
                     let isInUnheldModifierZone: Bool
                     if let mod = modifier {
                         isInUnheldModifierZone = !heldModifiers.contains(mod)
@@ -293,7 +296,7 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
                             completions = completionProvider?.completions(
                                 forPartial: currentPartialWord, maxCount: 3
                             ) ?? []
-                        } else if let zoneID = zoneProvider.zoneID(at: fx, y: fy) {
+                        } else if let zoneID = zoneProvider.zoneID(at: calX, y: calY) {
                             if !emittedZoneKeys.contains(zoneID) {
                                 emittedZoneKeys.insert(zoneID)
                                 let passesSize = contact.size >= minContactSize
@@ -328,9 +331,6 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
                                                 in: KeyGrid.default
                                             )
                                             userCalibration.save()
-                                            let calibratedGrid = KeyGrid.default.applying(calibration: userCalibration)
-                                            zoneProvider = calibratedGrid
-                                            resolver = CharacterEmitter(grid: calibratedGrid)
                                         }
 
                                         completions = completionProvider?.completions(
