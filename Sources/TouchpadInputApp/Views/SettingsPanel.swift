@@ -17,6 +17,10 @@ struct SettingsPanel: View {
                        value: String(format: "%.2f", session.pressureFloor)) {
                 Slider(value: $session.pressureFloor, in: 0.05...0.50, step: 0.05)
             }
+            settingRow(label: "Force-press threshold",
+                       value: String(format: "%.2f", session.forcePressThreshold)) {
+                Slider(value: $session.forcePressThreshold, in: 0.70...1.00, step: 0.05)
+            }
             settingRow(label: "Min contact size",
                        value: String(format: "%.2f", session.minContactSize)) {
                 Slider(value: $session.minContactSize, in: 0.0...1.0, step: 0.05)
