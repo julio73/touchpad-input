@@ -12,13 +12,14 @@ public struct CharacterEmitter: CharacterResolver {
     // MARK: CharacterResolver
 
     public func character(forZoneID id: String, pressure: Float,
-                          modifiers: Set<AnyModifierKind>, pressureFloor: Float) -> Character? {
+                          modifiers: Set<AnyModifierKind>, pressureFloor: Float,
+                          forcePressThreshold: Float = 0.95) -> Character? {
         guard pressure >= pressureFloor else { return nil }
         guard let zone = grid.zones.first(where: { String($0.character) == id }) else { return nil }
         if modifiers.contains(.shift) {
             return Character(String(zone.character).uppercased())
         }
-        return resolve(zone: zone, pressure: pressure)
+        return resolve(zone: zone, pressure: pressure, forcePressThreshold: forcePressThreshold)
     }
 
     // MARK: Legacy coordinate-based API (kept for direct-use tests)
@@ -27,13 +28,13 @@ public struct CharacterEmitter: CharacterResolver {
                                   pressure: Float, pressureFloor: Float = 0.30) -> Character? {
         guard pressure >= pressureFloor else { return nil }
         guard let zone = grid.zone(at: x, y: y) else { return nil }
-        return resolve(zone: zone, pressure: pressure)
+        return resolve(zone: zone, pressure: pressure, forcePressThreshold: 0.95)
     }
 
     // MARK: Private
 
-    private func resolve(zone: KeyZone, pressure: Float) -> Character {
-        if pressure >= 0.95 {
+    private func resolve(zone: KeyZone, pressure: Float, forcePressThreshold: Float) -> Character {
+        if pressure >= forcePressThreshold {
             return zone.altCharacter ?? Character(String(zone.character).uppercased())
         } else {
             return zone.character

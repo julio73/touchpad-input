@@ -60,6 +60,7 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
     // MARK: Stability settings
 
     @Published public var pressureFloor: Float = 0.30
+    @Published public var forcePressThreshold: Float = 0.95
     @Published public var minContactSize: Float = 0.0
     @Published public var zoneCooldownMs: Double = 80.0
 
@@ -308,7 +309,8 @@ public final class TouchInputSession: ObservableObject, @preconcurrency TouchEve
                                         forZoneID: zoneID,
                                         pressure: effectivePressure,
                                         modifiers: heldModifiers,
-                                        pressureFloor: pressureFloor
+                                        pressureFloor: pressureFloor,
+                                        forcePressThreshold: forcePressThreshold
                                     ) {
                                         outputBuffer.append(ch)
                                         externalOutputTarget?.emit(character: ch)
