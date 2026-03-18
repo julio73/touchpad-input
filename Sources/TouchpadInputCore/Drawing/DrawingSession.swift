@@ -26,8 +26,8 @@ public final class DrawingSession: ObservableObject, TouchEventReceiver {
     @Published public var liveFingers: [FingerState] = []
     @Published public var strokes: [DrawingStroke] = []
 
-    public var currentColor: CGColor = CGColor(gray: 0, alpha: 1)
-    public var currentLineWidth: CGFloat = 2.5
+    @Published public var currentColor: CGColor = CGColor(gray: 0, alpha: 1)
+    @Published public var currentLineWidth: CGFloat = 2.5
 
     // Map touch identifier → index in strokes
     private var activeIdx: [Int32: Int] = [:]
@@ -81,6 +81,12 @@ public final class DrawingSession: ObservableObject, TouchEventReceiver {
     public func undo() {
         guard !strokes.isEmpty else { return }
         strokes.removeLast()
+    }
+
+    /// Ends all active strokes so the next touch starts a new stroke.
+    public func endActiveStrokes() {
+        activeIdx.removeAll()
+        prevIDs.removeAll()
     }
 
     public func clear() {
