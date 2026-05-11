@@ -47,7 +47,7 @@ public struct TouchLogEntry: Identifiable, Sendable {
 // MARK: - TouchInputSession
 
 @MainActor
-public final class TouchInputSession: ObservableObject, @preconcurrency TouchEventReceiver {
+public final class TouchInputSession: ObservableObject, TouchEventReceiver {
 
     // MARK: Published state
 
