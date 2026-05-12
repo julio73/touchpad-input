@@ -30,18 +30,47 @@ public struct UserCalibration: Codable, Sendable {
 
     public init(offsets: [String: Offset]) { self.offsets = offsets }
 
-    private static let defaultsKey = "userCalibration"
+    private static let defaultsKey = "com.touchpad-input.userCalibration"
+    private static let legacyDefaultsKey = "userCalibration"
 
     public func save() {
-        guard let data = try? JSONEncoder().encode(self) else { return }
-        UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+        do {
+            let data = try JSONEncoder().encode(self)
+            UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+        } catch {
+            print("[UserCalibration] save failed: \(error)")
+        }
     }
 
     public static func load() -> UserCalibration {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
-              let cal = try? JSONDecoder().decode(UserCalibration.self, from: data)
-        else { return .empty }
-        return cal
+        if let data = UserDefaults.standard.data(forKey: defaultsKey) {
+            do {
+                return try JSONDecoder().decode(UserCalibration.self, from: data)
+            } catch {
+                print("[UserCalibration] decode failed (using empty): \(error)")
+                return .empty
+            }
+        }
+        // One-time migration: the key was previously unprefixed. Read the legacy
+        // entry, write it forward under the namespaced key, drop the old one.
+        // Failure path drops it too so we don't re-read garbage every launch.
+        guard let legacyData = UserDefaults.standard.data(forKey: legacyDefaultsKey) else {
+            return .empty
+        }
+        defer { UserDefaults.standard.removeObject(forKey: legacyDefaultsKey) }
+        do {
+            let cal = try JSONDecoder().decode(UserCalibration.self, from: legacyData)
+            cal.save()
+            return cal
+        } catch {
+            print("[UserCalibration] legacy decode failed (using empty): \(error)")
+            return .empty
+        }
+    }
+
+    public static func delete() {
+        UserDefaults.standard.removeObject(forKey: defaultsKey)
+        UserDefaults.standard.removeObject(forKey: legacyDefaultsKey)
     }
 
     /// EMA refinement called after every real tap. α ≈ 0.05 so ~20 taps meaningfully shift a zone.

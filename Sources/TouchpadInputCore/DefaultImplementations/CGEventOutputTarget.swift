@@ -82,5 +82,6 @@ public final class CGEventOutputTarget: OutputTarget {
         "%": (23, .maskShift), "^": (22, .maskShift), "&": (26, .maskShift), "*": (28, .maskShift),
         "(": (25, .maskShift), ")": (29, .maskShift),
         "_": (27, .maskShift), "+": (24, .maskShift), "{": (33, .maskShift), "}": (30, .maskShift),
+        "~": (50, .maskShift),
     ]
 }

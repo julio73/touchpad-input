@@ -139,20 +139,22 @@ public final class TouchInputSession: ObservableObject, TouchEventReceiver {
         userCalibration = .empty
         zoneProvider = KeyGrid.default
         resolver = CharacterEmitter(grid: .default)
-        UserDefaults.standard.removeObject(forKey: "userCalibration")
+        UserCalibration.delete()
     }
 
     // MARK: Autocomplete helpers
 
+    private static func isWordSeparator(_ c: Character) -> Bool { c == " " || c == "\n" }
+
     public var currentPartialWord: String {
-        if let lastSep = outputBuffer.lastIndex(where: { $0 == " " || $0 == "\n" }) {
+        if let lastSep = outputBuffer.lastIndex(where: Self.isWordSeparator) {
             return String(outputBuffer[outputBuffer.index(after: lastSep)...])
         }
         return outputBuffer
     }
 
     public func acceptCompletion(_ word: String) {
-        if let lastSep = outputBuffer.lastIndex(where: { $0 == " " || $0 == "\n" }) {
+        if let lastSep = outputBuffer.lastIndex(where: Self.isWordSeparator) {
             let prefix = String(outputBuffer[...lastSep])
             outputBuffer = prefix + word + " "
         } else {
@@ -303,14 +305,9 @@ public final class TouchInputSession: ObservableObject, TouchEventReceiver {
                                 let timeSinceMs = (timestamp - (lastZoneEmitTime[zoneID] ?? -999)) * 1000
                                 let passesCooldown = timeSinceMs >= zoneCooldownMs
                                 if passesSize && passesCooldown {
-                                    var effectivePressure = Float(pressure)
-                                    if heldModifiers.contains(.shift),
-                                       effectivePressure >= pressureFloor, effectivePressure < 0.70 {
-                                        effectivePressure = 0.70
-                                    }
                                     if let ch = resolver.character(
                                         forZoneID: zoneID,
-                                        pressure: effectivePressure,
+                                        pressure: Float(pressure),
                                         modifiers: heldModifiers,
                                         pressureFloor: pressureFloor,
                                         forcePressThreshold: forcePressThreshold

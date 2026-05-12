@@ -83,7 +83,6 @@ public final class DrawingSession: ObservableObject, TouchEventReceiver {
         strokes.removeLast()
     }
 
-    /// Ends all active strokes so the next touch starts a new stroke.
     public func endActiveStrokes() {
         activeIdx.removeAll()
         prevIDs.removeAll()
@@ -91,8 +90,7 @@ public final class DrawingSession: ObservableObject, TouchEventReceiver {
 
     public func clear() {
         strokes = []
-        activeIdx = [:]
-        prevIDs = []
+        endActiveStrokes()
     }
 
     /// Renders all strokes to an NSImage of the given size.
@@ -122,12 +120,27 @@ public final class DrawingSession: ObservableObject, TouchEventReceiver {
             CGPoint(x: $0.x * canvasSize.width, y: $0.y * canvasSize.height)
         }
         path.move(to: pts[0])
-        for i in 1..<pts.count - 1 {
-            let mid = CGPoint(x: (pts[i].x + pts[i + 1].x) / 2,
-                              y: (pts[i].y + pts[i + 1].y) / 2)
-            path.curve(to: mid, controlPoint1: pts[i], controlPoint2: mid)
+        if pts.count == 2 {
+            path.line(to: pts[1])
+        } else {
+            // NSBezierPath has no quadratic primitive; mirror the SwiftUI Canvas
+            // `addQuadCurve(to: mid, control: pts[i])` by lifting the quadratic
+            // (P0, P1, P2) to an equivalent cubic with C1 = P0 + 2/3·(P1 − P0)
+            // and C2 = P2 + 2/3·(P1 − P2).
+            for i in 1..<pts.count - 1 {
+                let p0 = i == 1 ? pts[0] : CGPoint(x: (pts[i - 1].x + pts[i].x) / 2,
+                                                   y: (pts[i - 1].y + pts[i].y) / 2)
+                let p1 = pts[i]
+                let p2 = CGPoint(x: (pts[i].x + pts[i + 1].x) / 2,
+                                 y: (pts[i].y + pts[i + 1].y) / 2)
+                let c1 = CGPoint(x: p0.x + 2.0 / 3.0 * (p1.x - p0.x),
+                                 y: p0.y + 2.0 / 3.0 * (p1.y - p0.y))
+                let c2 = CGPoint(x: p2.x + 2.0 / 3.0 * (p1.x - p2.x),
+                                 y: p2.y + 2.0 / 3.0 * (p1.y - p2.y))
+                path.curve(to: p2, controlPoint1: c1, controlPoint2: c2)
+            }
+            path.line(to: pts[pts.count - 1])
         }
-        path.line(to: pts[pts.count - 1])
         path.stroke()
     }
 }

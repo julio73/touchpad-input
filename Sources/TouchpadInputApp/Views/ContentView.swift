@@ -34,26 +34,14 @@ struct ContentView: View {
                 }
                 Divider()
                 HStack(spacing: 0) {
-                    TrackpadSurface(
-                        fingers: session.liveFingers,
-                        isActive: session.isActive,
-                        zones: KeyGrid.default.zones,
-                        activeModifiers: session.activeModifiers
-                    )
-                        .padding(16)
+                    trackpadSurface.padding(16)
                     Divider()
                     FingerTablePanel(fingers: session.liveFingers)
                         .frame(width: 340)
                 }
                 Divider()
                 HStack(spacing: 0) {
-                    TrackpadSurface(
-                        fingers: session.liveFingers,
-                        isActive: session.isActive,
-                        zones: KeyGrid.default.zones,
-                        activeModifiers: session.activeModifiers
-                    )
-                        .padding(16)
+                    trackpadSurface.padding(16)
                     Divider()
                     OutputBufferPanel(text: session.outputBuffer, activeModifiers: session.activeModifiers)
                     Divider()
@@ -83,6 +71,15 @@ struct ContentView: View {
                 }
             )
         }
+    }
+
+    private var trackpadSurface: TrackpadSurface {
+        TrackpadSurface(
+            fingers: session.liveFingers,
+            isActive: session.isActive,
+            zones: KeyGrid.default.zones,
+            activeModifiers: session.activeModifiers
+        )
     }
 
     private var header: some View {
