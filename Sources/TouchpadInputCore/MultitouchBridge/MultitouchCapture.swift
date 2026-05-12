@@ -5,6 +5,9 @@ import Darwin
 // MARK: - TouchEventReceiver
 
 /// Protocol implemented by any session that can receive raw multitouch data.
+/// MainActor-isolated: the multitouch callback hops to main before delivering frames,
+/// and all UI-facing state mutations must happen there.
+@MainActor
 public protocol TouchEventReceiver: AnyObject {
     func update(mtContacts: [MTContact], timestamp: Double)
     var isActive: Bool { get set }
@@ -29,19 +32,24 @@ private let mtFrameCallback: MTCallbackFn = { _, rawPtr, count, timestamp, _ in
         Array(UnsafeBufferPointer(start: ptr, count: n))
     }
     DispatchQueue.main.async {
-        MultitouchCapture.shared.session?.update(mtContacts: contacts, timestamp: timestamp)
+        // The block runs on the main thread; assert MainActor isolation so we can
+        // touch the singleton's MainActor-isolated state without a Task hop.
+        MainActor.assumeIsolated {
+            MultitouchCapture.shared.session?.update(mtContacts: contacts, timestamp: timestamp)
+        }
     }
 }
 
 // MARK: - MultitouchCapture
 
-public final class MultitouchCapture: @unchecked Sendable {
+@MainActor
+public final class MultitouchCapture {
     public static let shared = MultitouchCapture()
 
-    nonisolated(unsafe) public weak var session: (any TouchEventReceiver)?
-    private nonisolated(unsafe) var keyMonitor: Any?
-    private nonisolated(unsafe) var lastControlPressTime: TimeInterval = 0
-    private nonisolated(unsafe) var devices: [AnyObject] = []
+    public weak var session: (any TouchEventReceiver)?
+    private var keyMonitor: Any?
+    private var lastControlPressTime: TimeInterval = 0
+    private var devices: [AnyObject] = []
 
     private let lib = dlopen(
         "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport",

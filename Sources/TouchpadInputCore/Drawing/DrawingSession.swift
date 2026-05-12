@@ -20,7 +20,7 @@ public struct DrawingStroke: Identifiable, Sendable {
 // MARK: - DrawingSession
 
 @MainActor
-public final class DrawingSession: ObservableObject, @preconcurrency TouchEventReceiver {
+public final class DrawingSession: ObservableObject, TouchEventReceiver {
 
     @Published public var isActive: Bool = false
     @Published public var liveFingers: [FingerState] = []

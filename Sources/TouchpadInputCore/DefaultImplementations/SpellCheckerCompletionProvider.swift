@@ -2,7 +2,7 @@
 import AppKit
 
 /// Uses NSSpellChecker to generate word completions for partial input.
-public struct SpellCheckerCompletionProvider: CompletionProvider, @unchecked Sendable {
+public struct SpellCheckerCompletionProvider: CompletionProvider {
     public init() {}
 
     public func completions(forPartial partial: String, maxCount: Int) -> [String] {
